@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reactip"
+version = "0.1.0"
+description = "Reactive Interatomic Potential inference library for NequIP/Allegro models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nequip",
+    "ase",
+    "numpy",
+    "imageio",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reactip*"]

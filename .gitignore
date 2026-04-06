@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+reactip.egg-info/
+README copy.md
+tests/
+logs/
+
+# Legacy local-only demo/example entrypoints and notebooks
+demo_*.py
+example_*.py
+demo_*.ipynb
+example_*.ipynb
+docs/*demo*.ipynb
+docs/*example*.ipynb
+
+# Exclude large local-only research and backup trees from the initial publish
+benchmark/
+backups/
+models_backup/
+
+# Local archives
+*.zip

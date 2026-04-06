@@ -1,0 +1,72 @@
+{
+  "artifact_paths": {
+    "trajectory_gif": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30/trajectory.gif",
+    "trajectory_sdf": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30/trajectory.sdf"
+  },
+  "case": "butadiene_ethylene_diels_alder__C6H10",
+  "case_kind": "benchmark",
+  "converged": false,
+  "delta_e": null,
+  "elapsed_seconds": 93.7070441688411,
+  "energies": [
+    0.0,
+    2.9430541781694046,
+    13.021533134593483,
+    57.00797834786863,
+    135.57541832128845,
+    -71.07389296843758
+  ],
+  "formula": "C6H10",
+  "frame_count": 6,
+  "has_ts": false,
+  "isomers_file": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt",
+  "mlip_model_name": "model_e1f9_l2_f32_cuda_sm86.nequip.pt2",
+  "mlip_model_path": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/models/model_e1f9_l2_f32_cuda_sm86.nequip.pt2",
+  "nnodes": 6,
+  "npeaks": null,
+  "raw_output_paths": {
+    "grown_string1_xyz": null,
+    "grown_string_xyz": null,
+    "opt_converged_xyz": null,
+    "scratch_dir": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30/scratch",
+    "ts_node_xyz": null
+  },
+  "reaction_label": "Butadiene + ethylene Diels-Alder",
+  "run_directory": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30",
+  "runtime_error": "LoTError: ReactIPLoT calculation failed for state (charge=0, multiplicity=1, adiabatic_state=0): ReactIPCalculator: max force component = 5827.1 exceeds threshold 100.0",
+  "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/reactip/reactip_lot.py\", line 91, in run\n    result = calculator.calculate(atoms)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/reactip/mlip_calculator.py\", line 198, in calculate\n    self._validate(result)\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/reactip/mlip_calculator.py\", line 321, in _validate\n    raise CalculationFailed(\nase.calculators.calculator.CalculationFailed: ReactIPCalculator: max force component = 5827.1 exceeds threshold 100.0\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/run_se_gsm.py\", line 229, in run_with_reporting\n    result = run_se_gsm_core(\n             ^^^^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/run_se_gsm.py\", line 149, in run_se_gsm_core\n    return _run_se_gsm(**kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/reactip/se_gsm.py\", line 461, in run_se_gsm\n    gsm.go_gsm(max_gsm_iters, max_opt_steps, rtype=rtype)\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/growing_string_methods/se_gsm.py\", line 132, in go_gsm\n    energies = self.energies\n               ^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/growing_string_methods/gsm.py\", line 319, in energies\n    E.append(ico.energy - self.nodes[0].energy)\n             ^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/molecule/molecule.py\", line 399, in energy\n    return self.PES.get_energy(self.xyz)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/potential_energy_surfaces/pes.py\", line 178, in get_energy\n    return self.lot.get_energy(xyz, self.multiplicity, self.ad_idx) + fdE + kdE   # Kcal/mol\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/level_of_theories/base_lot.py\", line 404, in get_energy\n    self.runall(geom,runtype)\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/level_of_theories/base_lot.py\", line 470, in runall\n    self.run(geom, mult, ad_idx)\n  File \"/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/reactip/reactip_lot.py\", line 93, in run\n    raise LoTError(\npyGSM.level_of_theories.base_lot.LoTError: ReactIPLoT calculation failed for state (charge=0, multiplicity=1, adiabatic_state=0): ReactIPCalculator: max force component = 5827.1 exceeds threshold 100.0\n",
+  "runtime_provenance": {
+    "conda_default_env": "reactip",
+    "cwd": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30",
+    "pygsm_package": "/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/__init__.py",
+    "python_executable": "/home/alatoo/anaconda3/envs/reactip/bin/python",
+    "python_version": "3.11.15",
+    "pythonpath": null,
+    "which_gsm": null,
+    "xtb_lot_module": "/home/alatoo/projects/ml_potentials/workdir_reactip/se-gsm/pyGSM/pyGSM/level_of_theories/xtb_lot.py"
+  },
+  "se_gsm_parameters": {
+    "adiabatic_state": 0,
+    "charge": 0,
+    "conv_tol": 0.0005,
+    "coordinate_type": "DLC",
+    "device": "cuda",
+    "max_abs_energy": 10000.0,
+    "max_force": 100.0,
+    "max_gsm_iters": 100,
+    "max_opt_steps": 20,
+    "multiplicity": 1,
+    "num_nodes": 30,
+    "optimizer": "eigenvector_follow",
+    "reactant_geom_fixed": false,
+    "rtype": 2,
+    "run_id": 1
+  },
+  "source_fixture": null,
+  "status": "runtime_error_after_partial_output",
+  "trajectory_source": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/runs/diels_alder_dlc30/scratch/growth_iters_001_004.xyz",
+  "ts_energy": null,
+  "ts_node": null,
+  "warnings": [],
+  "xyz_file": "/home/alatoo/projects/ml_potentials/workdir_reactip/reactip/examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz"
+}
