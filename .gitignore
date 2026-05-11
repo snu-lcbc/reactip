@@ -1,11 +1,21 @@
+# Python/package build artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Notebook/editor/local assistant state
 .ipynb_checkpoints/
-reactip.egg-info/
-README copy.md
-tests/
-logs/
+.codex
+.agents/
+.env
+README copy*.md
 
 # Legacy local-only demo/example entrypoints and notebooks
 demo_*.py
@@ -15,10 +25,25 @@ example_*.ipynb
 docs/*demo*.ipynb
 docs/*example*.ipynb
 
-# Exclude large local-only research and backup trees from the initial publish
+# Runtime outputs and local research/report artifacts
+logs/
+runs/
+tests/
+*.out
+slurm-*.out
+reactip_report_*/
+reactip_presentation_*/
 benchmark/
 backups/
 models_backup/
 
-# Local archives
+# Local model/checkpoint/archive artifacts. Keep the documented bundled models tracked.
+models/*.ckpt
+models/*.pt
+models/*.pth
+models/*.pt2
+models/*.nequip.pth
+models/*.nequip.pt2
+!models/model_e1f9_l2_f32_cuda_sm86.nequip.pt2
 *.zip
+!models/model_e1f9_l2_f32.nequip.zip
