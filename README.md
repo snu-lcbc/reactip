@@ -11,16 +11,30 @@ compilation, while packaged `.nequip.zip` models remain usable for CPU runs.
 
 ## Install
 
-Requires Python >= 3.10.
+Requires Python >= 3.10. We recommend [`uv`](https://docs.astral.sh/uv/) for
+fast, reproducible installs.
 
 ```bash
 git clone https://github.com/snu-lcbc/reactip.git
 cd reactip
-pip install -e .
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e .
 ```
+
+With plain `pip`:
+
+```bash
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e .
+```
+
+(`uv` reads the `[tool.uv.sources]` block in `pyproject.toml` and pulls the
+CUDA 12.8 build of `torch` automatically; with plain `pip` you pass the
+index URL explicitly.)
 
 Dependencies (resolved automatically from `pyproject.toml`):
 
+- `torch` (CUDA 12.8 build)
 - `nequip` 0.17
 - `ase` 3.28
 - `numpy` 2.4
@@ -39,14 +53,19 @@ python run_se_gsm.py \
     --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
     --isomers examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt \
     --formula C6H10 \
-    --device cpu \
-    --num-nodes 15 \
-    --max-iters 25 \
+    --device cuda \
+    --num-nodes 30 \
+    --max-iters 30 \
     --max-opt-steps 15 \
     --optimizer eigenvector_follow \
     --rtype 2 \
     --output-dir runs/diels_alder
 ```
+This is a short installation smoke run that writes `summary.json`,
+`trajectory.sdf`, and `trajectory.gif`. For production SE-GSM searches,
+increase `--num-nodes`, `--max-iters`, and `--max-opt-steps` after confirming
+the model and reaction remain within the calculator safety thresholds.
+
 For the full CLI surface: `python run_se_gsm.py --help`
 
 This SE-GSM program calls the MLIP single-point calculator internally to evaluate energies and forces.
