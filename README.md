@@ -9,51 +9,60 @@ ASE-native calculator and a
 ReactIP is optimized primarily for GPU inference and target-specific
 compilation, while packaged `.nequip.zip` models remain usable for CPU runs.
 
-## Core rules
-
-- `ReactIPCalculator` stays in ASE units: `eV` and `eV/Angstrom`.
-- If you want standalone reporting in `kcal/mol`, convert a returned result
-  dict explicitly with `ReactIPCalculator.convert_results_to_units(...)`.
-- The supported SE-GSM path is `pyGSM` + `ReactIPLoT`.
-- Model weights are not assumed to be committed to Git. Pass `--model` or set
-  `REACTIP_MODEL`.
-
 ## Install
 
-From the `reactip/` directory:
+Requires Python >= 3.10.
 
 ```bash
+git clone https://github.com/snu-lcbc/reactip.git
+cd reactip
 pip install -e .
 ```
 
-SE-GSM functionality also requires `pyGSM`. Install it from the upstream
-repository:
+Dependencies (resolved automatically from `pyproject.toml`):
+
+- `nequip` 0.17
+- `ase` 3.28
+- `numpy` 2.4
+- `imageio` 2.37
+- `matplotlib` 3.10
+- `pyGSM` — patched fork at [`snu-lcbc/pyGSM`](https://github.com/snu-lcbc/pyGSM)
+
+
+## SE-GSM + ReactIP (MLIP Calculator)
 
 ```bash
-git clone https://github.com/ZimmermanGroup/pyGSM.git
-cd pyGSM
-pip install -e .
+python run_se_gsm.py \
+    --model models/model_e1f9_l2_f32.nequip.zip \
+    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
+    --isomers examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt \
+    --formula C6H10 \
+    --device cuda \
+    --num-nodes 15 \
+    --max-iters 25 \
+    --max-opt-steps 15 \
+    --optimizer eigenvector_follow \
+    --rtype 2 \
+    --output-dir runs/diels_alder
+```
+For the full CLI surface: `python run_se_gsm.py --help`
+
+This SE-GSM program calls the MLIP single-point calculator internally to evaluate energies and forces.
+
+## ReactIP Single-point Calculator
+
+`reactip_calculator.py` is a standalone program for single-point energy and force evaluation. It only requires molecular coordinates.
+
+```bash
+python reactip_calculator.py \
+    --model models/model_e1f9_l2_f32.nequip.zip \
+    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
+    --device cuda
 ```
 
-For local development, ReactIP also tries `REACTIP_PYGSM_DIR` and a sibling
-`../se-gsm/pyGSM` checkout as import fallbacks when `pyGSM` is not installed in
-the active environment.
+For the full CLI surface:`python reactip_calculator.py --help`
 
 
-## Quick start
-
-```python
-from reactip import ReactIPCalculator
-
-calc = ReactIPCalculator("models/model_e1f9_l2_f32.nequip.zip", device="cpu")
-result = calc.calculate_xyz(xyz_string)
-
-energy_ev = result["energy"]
-forces_ev_per_a = result["forces"]
-
-result_kcal = ReactIPCalculator.convert_results_to_units(result, energy_units="kcal/mol")
-energy_kcal = result_kcal["energy"]
-```
 
 ## Model formats
 
@@ -67,77 +76,13 @@ energy_kcal = result_kcal["energy"]
 The `.ckpt` path loads the model directly for inference. For production use,
 pre-compile with `nequip-compile`.
 
-The default bundled model package in this repository is:
+The default model package in this repository is:
 
 - `models/model_e1f9_l2_f32.nequip.zip`
 
 The `models/` directory contains packaged and compiled model artifacts. For
 target-specific compilation workflows, see `deployment/README.md`,
 `deployment/compile_from_package.sh`, and `deployment/compile_model.slurm`.
-
-## Calculator CLI
-
-Use `reactip_calculator.py` for single-point energy and force evaluation from
-an XYZ file:
-
-```bash
-python reactip_calculator.py \
-    --model models/model_e1f9_l2_f32.nequip.zip \
-    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
-    --device cpu
-```
-
-If you want converted standalone output:
-
-```bash
-python reactip_calculator.py \
-    --model models/model_e1f9_l2_f32.nequip.zip \
-    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
-    --units kcal/mol
-```
-
-For the full CLI surface:
-
-```bash
-python reactip_calculator.py --help
-```
-
-## SE-GSM CLI
-
-Use `run_se_gsm.py` for pyGSM runs plus exported artifacts:
-
-```bash
-python run_se_gsm.py \
-    --model models/model_e1f9_l2_f32.nequip.zip \
-    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
-    --isomers examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt \
-    --label butadiene_ethylene_diels_alder__C6H10 \
-    --reaction-label "Butadiene + ethylene Diels-Alder" \
-    --formula C6H10 \
-    --case-kind benchmark \
-    --device cpu \
-    --num-nodes 15 \
-    --max-iters 25 \
-    --max-opt-steps 15 \
-    --optimizer eigenvector_follow \
-    --rtype 2 \
-    --output-dir runs/diels_alder \
-    --ID 1
-```
-
-`run_se_gsm.py` writes both raw pyGSM output and exported report artifacts in
-the chosen run directory:
-
-- `summary.json`
-- `trajectory.sdf`
-- `trajectory.gif`
-- raw pyGSM files such as `grown_string_*.xyz`, `TSnode_*.xyz`, and `scratch/`
-
-For the full CLI surface:
-
-```bash
-python run_se_gsm.py --help
-```
 
 ## Python API
 
@@ -195,32 +140,16 @@ Returned SE-GSM metadata includes:
 - `ts_node`, `ts_energy`, and `delta_e` only when a unique TS is actually present
 
 For a reproducible named example plus exported trajectory artifacts, use
-`run_se_gsm.py` with the bundled benchmark inputs under
-`examples/benchmark_cases/`.
+`run_se_gsm.py` with the benchmark inputs under `examples/benchmark_cases/`.
 
-## Bundled input data
+## Conventions
 
-The repository includes input files that you can use directly with the two
-CLI tools or the Python API:
-
-- `examples/benchmark_cases/`
-  - public benchmark inputs
-- `examples/seed_structures/`
-  - supplemental XYZ structures for calculator checks or future SE-GSM work
-- `examples/exploratory_cases/`
-  - research-only exploratory inputs
-
-Current benchmark case:
-
-- `examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz`
-- `examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt`
-
-Current exploratory case:
-
-- `examples/exploratory_cases/2_4_diphenylpentane__C17H20/reactant.xyz`
-
-## State support
-
-The interface accepts `charge`, `multiplicity`, and `adiabatic_state`, but the
-current runtime support is intentionally restricted to `(0, 1, 0)`. Any other
-state request fails fast.
+- `ReactIPCalculator` stays in ASE units: `eV` and `eV/Angstrom`.
+- If you want standalone reporting in `kcal/mol`, convert a returned result
+  dict explicitly with `ReactIPCalculator.convert_results_to_units(...)`.
+- The supported SE-GSM path is `pyGSM` + `ReactIPLoT`.
+- A default model is included at `models/model_e1f9_l2_f32.nequip.zip`.
+  For any other model, pass `--model` or set `REACTIP_MODEL`.
+- The interface accepts `charge`, `multiplicity`, and `adiabatic_state`, but
+  the current runtime support is intentionally restricted to `(0, 1, 0)`. Any
+  other state request fails fast.

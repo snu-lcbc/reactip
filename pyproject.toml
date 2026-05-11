@@ -9,12 +9,12 @@ description = "Reactive Interatomic Potential inference library for NequIP/Alleg
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "nequip",
-    "ase",
-    "numpy",
-    "imageio",
-    "matplotlib",
-    "pyGSM @ git+https://github.com/snu-lcbc/pyGSM.git@reactip-compat",
+    "nequip==0.17.1",
+    "ase==3.28.0",
+    "numpy==2.4.4",
+    "imageio==2.37.3",
+    "matplotlib==3.10.9",
+    "pyGSM @ git+https://github.com/snu-lcbc/pyGSM.git@d9de49dcd5339ee7aee8d1776a064c7bb3092e82",
 ]
 
 [tool.setuptools.packages.find]
