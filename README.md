@@ -28,6 +28,8 @@ Dependencies (resolved automatically from `pyproject.toml`):
 - `matplotlib` 3.10
 - `pyGSM` — patched fork at [`snu-lcbc/pyGSM`](https://github.com/snu-lcbc/pyGSM)
 
+The commands below use `--device cpu` for a portable first run. Use
+`--device cuda` on a machine with an NVIDIA GPU and driver.
 
 ## SE-GSM + ReactIP (MLIP Calculator)
 
@@ -37,7 +39,7 @@ python run_se_gsm.py \
     --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
     --isomers examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/isomers.txt \
     --formula C6H10 \
-    --device cuda \
+    --device cpu \
     --num-nodes 15 \
     --max-iters 25 \
     --max-opt-steps 15 \
@@ -57,10 +59,10 @@ This SE-GSM program calls the MLIP single-point calculator internally to evaluat
 python reactip_calculator.py \
     --model models/model_e1f9_l2_f32.nequip.zip \
     --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
-    --device cuda
+    --device cpu
 ```
 
-For the full CLI surface:`python reactip_calculator.py --help`
+For the full CLI surface: `python reactip_calculator.py --help`
 
 
 
