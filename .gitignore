@@ -28,7 +28,8 @@ docs/*example*.ipynb
 # Runtime outputs and local research/report artifacts
 logs/
 runs/
-tests/
+tests/*
+!tests/test_sampled_search.py
 *.out
 slurm-*.out
 reactip_report_*/

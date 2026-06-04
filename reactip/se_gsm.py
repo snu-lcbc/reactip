@@ -310,12 +310,29 @@ def _analyze_gsm_result(gsm: SE_GSM) -> dict:
     ts_node = int(gsm.TSnode) if has_ts else None
     ts_energy = None
     delta_e = None
+    reactant_node = 0 if energies else None
+    product_node = None
+    product_energy = None
+    product_delta_e = None
+    score_delta_e = None
+    score_delta_e_source = None
 
     if ts_node is not None:
-        min_reactant = int(np.argmin(energies[: ts_node + 1]))
-        min_product = ts_node + int(np.argmin(energies[ts_node:]))
-        ts_energy = energies[ts_node] - energies[min_reactant]
-        delta_e = energies[min_product] - energies[min_reactant]
+        reactant_node = int(np.argmin(energies[: ts_node + 1]))
+        product_node = ts_node + int(np.argmin(energies[ts_node:]))
+        ts_energy = energies[ts_node] - energies[reactant_node]
+        delta_e = energies[product_node] - energies[reactant_node]
+        product_delta_e = delta_e
+        score_delta_e = delta_e
+        score_delta_e_source = "post_ts_minimum"
+    elif len(energies) >= 2:
+        product_node = len(energies) - 1
+        product_delta_e = energies[product_node] - energies[reactant_node]
+        score_delta_e = product_delta_e
+        score_delta_e_source = "endpoint"
+
+    if product_node is not None:
+        product_energy = energies[product_node]
 
     status = _determine_status(
         is_converged=is_converged,
@@ -335,6 +352,12 @@ def _analyze_gsm_result(gsm: SE_GSM) -> dict:
         "ts_node": ts_node,
         "ts_energy": ts_energy,
         "delta_e": delta_e,
+        "reactant_node": reactant_node,
+        "product_node": product_node,
+        "product_energy": product_energy,
+        "product_delta_e": product_delta_e,
+        "score_delta_e": score_delta_e,
+        "score_delta_e_source": score_delta_e_source,
         "energies": energies,
     }
 
@@ -476,6 +499,12 @@ def run_se_gsm(
         manage_xyz.write_xyz(f"TSnode_{ID}.xyz", gsm.nodes[result["ts_node"]].geometry)
     else:
         print(f"\n  No unique TS was identified. status={result['status']}")
+        if result["score_delta_e"] is not None:
+            print(
+                "  Candidate endpoint dE: "
+                f"{result['score_delta_e']:.2f} kcal/mol "
+                f"({result['score_delta_e_source']})"
+            )
 
     return result
 

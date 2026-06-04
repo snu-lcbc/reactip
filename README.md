@@ -70,6 +70,50 @@ For the full CLI surface: `python run_se_gsm.py --help`
 
 This SE-GSM program calls the MLIP single-point calculator internally to evaluate energies and forces.
 
+### Sample and rank candidate products
+
+Standalone feature documentation: [`docs/reaction_path_sampling.md`](docs/reaction_path_sampling.md)
+
+Use `--sample-products` to generate candidate driving-coordinate sets from a
+reactant, run SE-GSM for each candidate, and print Boltzmann-ranked products:
+
+```bash
+python run_se_gsm.py \
+    --model models/model_e1f9_l2_f32.nequip.zip \
+    --xyz examples/benchmark_cases/butadiene_ethylene_diels_alder__C6H10/reactant.xyz \
+    --sample-products \
+    --sample-count 10 \
+    --sample-iterations 3 \
+    --resample-top-k 3 \
+    --print-top 5 \
+    --sample-score-mode thermodynamic \
+    --sample-min-quality converged \
+    --device cuda \
+    --output-dir runs/sample_search
+```
+
+By default, sampled searches rank only converged candidates. The default
+`--sample-score-mode thermodynamic` reports equilibrium-like product populations
+with weights proportional to `exp(-dE / RT)`, where `dE` is the cumulative
+product energy relative to the original root reactant. This cumulative score is
+important for two-step and three-step searches because products sampled from
+different parents do not share a local energy reference.
+
+Use `--sample-score-mode kinetic` only when you want a TST-like path proxy based
+on cumulative TS barriers; candidates without a unique TS are excluded from
+kinetic ranking. Use `--sample-min-quality finite` only for debugging or smoke
+runs because it can include early-ended strings. The default ADD search cutoff is
+5.0 Å for heavy atoms, matching the MLIP neighborhood radius used in training as
+a defensible upper bound for candidate generation; it is still a sampling
+heuristic, not the MLIP message-passing cutoff itself. Two-ADD candidates do not
+share a new-bond atom unless `--sample-allow-shared-add-atoms` is set.
+
+Sampled searches write per-candidate `summary.json`, `isomers.txt`,
+`reactant.xyz`, `product.xyz`, and a top-level `candidate_search_summary.json`;
+add `--sample-export-artifacts` if you also want SDF/GIF artifacts for every
+sampled candidate. The model is loaded once and reused across sampled candidates;
+add `--sample-reload-model-each-candidate` only when debugging calculator state.
+
 ## ReactIP Single-point Calculator
 
 `reactip_calculator.py` is a standalone program for single-point energy and force evaluation. It only requires molecular coordinates.
