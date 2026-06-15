@@ -15,7 +15,7 @@ dependencies = [
     "numpy==2.4.4",
     "imageio==2.37.3",
     "matplotlib==3.10.9",
-    "pyGSM @ git+https://github.com/snu-lcbc/pyGSM.git@94e2eabf4f513967a6ff7f18525fbeed90b816f6",
+    "pyGSM @ git+https://github.com/snu-lcbc/pyGSM.git@reactip-compat",
 ]
 
 [tool.setuptools.packages.find]
