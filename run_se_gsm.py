@@ -41,8 +41,12 @@ from reactip.utils import (
 )
 from reactip.sampling import (
     DEFAULT_SAMPLE_MODES,
+    bond_signature,
     compute_boltzmann_populations,
+    count_bond_changes,
     driving_coords_to_lines,
+    generate_driving_coordinate_pool,
+    normalize_driving_coord_set,
     parse_sample_modes,
     sample_driving_coordinate_sets,
     write_isomers_file,
@@ -54,6 +58,12 @@ CHEMICAL_SYMBOLS: tuple[str, ...] = ("H", "C", "N", "O", "F", "S", "Cl", "Br")
 _GENERIC_XYZ_STEMS = {"reactant", "struc", "structure", "input", "geom", "geometry"}
 SAMPLE_SCORE_MODES = ("thermodynamic", "kinetic")
 SAMPLE_MIN_QUALITY_LEVELS = ("finite", "completed", "converged", "ts")
+# 1 eV in kcal/mol (NIST 2018 CODATA), matches ReactIPCalculator.EV_TO_KCAL_MOL.
+_EV_TO_KCAL_MOL = 23.060547830619026
+# Reaction/activation energies for the in-domain small molecules stay well under
+# a few hundred kcal/mol; larger magnitudes signal MLIP extrapolation failure
+# (atom dissociation, fused atoms) rather than real chemistry.
+DEFAULT_MAX_ABS_DELTA_E = 500.0
 _COMPLETED_SAMPLE_STATUSES = {
     "completed_no_ts",
     "completed_with_ts_candidate",
@@ -250,10 +260,14 @@ def run_with_reporting(
     rtype: int = 2,
     max_force: float = 100.0,
     max_abs_energy: float = 10000.0,
+    dqmag_max: float = 0.8,
+    bdist_ratio: float = 0.5,
+    add_node_tol: float = 0.01,
     reactant_geom_fixed: bool = False,
     run_id: int = 0,
     export_artifacts: bool = True,
     calculator=None,
+    verify_ts: bool = False,
 ) -> tuple[dict, Path, int]:
     model_path = Path(model_path).resolve()
     xyz_path = Path(xyz_file).resolve()
@@ -295,7 +309,11 @@ def run_with_reporting(
                 "rtype": rtype,
                 "max_force": max_force,
                 "max_abs_energy": max_abs_energy,
+                "dqmag_max": dqmag_max,
+                "bdist_ratio": bdist_ratio,
+                "add_node_tol": add_node_tol,
                 "reactant_geom_fixed": reactant_geom_fixed,
+                "verify_ts": verify_ts,
                 "chemical_symbols": CHEMICAL_SYMBOLS,
                 "ID": run_id,
             }
@@ -306,7 +324,9 @@ def run_with_reporting(
             result = run_se_gsm_core(
                 **run_kwargs,
             )
-        except Exception as exc:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
             run_error = f"{exc.__class__.__name__}: {exc}"
             run_traceback = traceback.format_exc()
             print()
@@ -361,6 +381,11 @@ def run_with_reporting(
             "score_delta_e_source": (
                 result["score_delta_e_source"] if result is not None else None
             ),
+            "ts_imaginary_mode_count": result.get("ts_imaginary_mode_count") if result is not None else None,
+            "ts_is_first_order_saddle": result.get("ts_is_first_order_saddle") if result is not None else None,
+            "ts_imaginary_frequencies_cm": result.get("ts_imaginary_frequencies_cm") if result is not None else None,
+            "ts_lowest_real_frequency_cm": result.get("ts_lowest_real_frequency_cm") if result is not None else None,
+            "ts_verification_error": result.get("ts_verification_error") if result is not None else None,
             "energies": energies,
             "artifact_paths": artifact_info["artifact_paths"],
             "raw_output_paths": collect_raw_output_paths(run_dir, run_id),
@@ -382,7 +407,11 @@ def run_with_reporting(
                 "rtype": rtype,
                 "max_force": max_force,
                 "max_abs_energy": max_abs_energy,
+                "dqmag_max": dqmag_max,
+                "bdist_ratio": bdist_ratio,
+                "add_node_tol": add_node_tol,
                 "reactant_geom_fixed": reactant_geom_fixed,
+                "verify_ts": verify_ts,
                 "run_id": run_id,
                 "export_artifacts": export_artifacts,
             },
@@ -407,25 +436,72 @@ def _finite_score(value: object) -> float | None:
     return score if math.isfinite(score) else None
 
 
+def _absolute_energy_ev(calculator, xyz_path: str | Path) -> float | None:
+    """Evaluate the absolute MLIP energy (eV) of one structure, or None.
+
+    Used to reference cumulative reaction energies to the root reactant on a
+    single, consistent energy scale. Failures (including out-of-domain geometries
+    that trip the calculator's safety validation) return None so the caller can
+    fall back to the stepwise estimate.
+    """
+    if calculator is None or xyz_path is None:
+        return None
+    try:
+        import ase.io
+
+        atoms = ase.io.read(str(xyz_path))
+        result = calculator.calculate(atoms)
+        energy = float(result["energy"])
+        return energy if math.isfinite(energy) else None
+    except Exception:
+        return None
+
+
 def _score_mode_description(score_mode: str) -> str:
     if score_mode == "kinetic":
-        return "TST-like cumulative TS-barrier proxy"
-    return "cumulative product dE"
+        return "rate-limiting (max) cumulative TS barrier"
+    return "cumulative product dE (vs root reactant)"
 
 
-def _annotate_candidate_path(candidate: dict, parent: dict, score_mode: str) -> None:
+def _annotate_candidate_path(
+    candidate: dict,
+    parent: dict,
+    score_mode: str,
+    *,
+    root_abs_energy_ev: float | None = None,
+) -> None:
     parent_product_delta_e = _finite_score(parent.get("path_product_delta_e")) or 0.0
     parent_barrier_sum = _finite_score(parent.get("path_kinetic_barrier_sum")) or 0.0
     parent_rate_limiting_barrier = _finite_score(parent.get("path_rate_limiting_barrier_e"))
+    parent_all_steps_have_ts = bool(parent.get("path_all_steps_have_ts", True))
 
     local_product_delta_e = _finite_score(candidate.get("product_delta_e"))
     local_ts_barrier_e = _finite_score(candidate.get("ts_energy"))
 
-    path_product_delta_e = (
+    # Telescoped per-step sum (kept for diagnostics; reference shifts at each
+    # re-optimized hand-off, so it is only approximate for multi-step paths).
+    path_product_delta_e_stepwise = (
         parent_product_delta_e + local_product_delta_e
         if local_product_delta_e is not None
         else None
     )
+
+    # Reference-consistent cumulative reaction energy: absolute MLIP energy of
+    # this product minus the root reactant, in kcal/mol. Preferred when the
+    # shared calculator supplied absolute energies.
+    product_abs_energy_ev = _finite_score(candidate.get("product_abs_energy_ev"))
+    path_product_delta_e_abs = None
+    if product_abs_energy_ev is not None and root_abs_energy_ev is not None:
+        path_product_delta_e_abs = (
+            (product_abs_energy_ev - root_abs_energy_ev) * _EV_TO_KCAL_MOL
+        )
+
+    path_product_delta_e = (
+        path_product_delta_e_abs
+        if path_product_delta_e_abs is not None
+        else path_product_delta_e_stepwise
+    )
+
     path_kinetic_barrier_sum = (
         parent_barrier_sum + local_ts_barrier_e
         if local_ts_barrier_e is not None
@@ -438,23 +514,35 @@ def _annotate_candidate_path(candidate: dict, parent: dict, score_mode: str) -> 
     else:
         path_rate_limiting_barrier_e = max(parent_rate_limiting_barrier, local_ts_barrier_e)
 
+    path_all_steps_have_ts = parent_all_steps_have_ts and (local_ts_barrier_e is not None)
+
     path_candidate_ids = list(parent.get("path_candidate_ids") or [])
     path_candidate_ids.append(str(candidate["candidate_id"]))
 
     candidate["parent_path_product_delta_e"] = parent_product_delta_e
     candidate["path_product_delta_e"] = path_product_delta_e
+    candidate["path_product_delta_e_stepwise"] = path_product_delta_e_stepwise
+    candidate["path_product_delta_e_abs"] = path_product_delta_e_abs
+    candidate["local_product_delta_e"] = local_product_delta_e
     candidate["local_ts_barrier_e"] = local_ts_barrier_e
     candidate["path_kinetic_barrier_sum"] = path_kinetic_barrier_sum
     candidate["path_rate_limiting_barrier_e"] = path_rate_limiting_barrier_e
+    candidate["path_all_steps_have_ts"] = path_all_steps_have_ts
     candidate["path_candidate_ids"] = path_candidate_ids
     candidate["path_depth"] = len(path_candidate_ids)
 
     if score_mode == "thermodynamic":
         candidate["ranking_score_delta_e"] = path_product_delta_e
-        candidate["ranking_score_source"] = "cumulative_product_delta_e"
+        candidate["ranking_score_source"] = (
+            "absolute_product_delta_e_vs_root"
+            if path_product_delta_e_abs is not None
+            else "cumulative_product_delta_e_stepwise"
+        )
     elif score_mode == "kinetic":
-        candidate["ranking_score_delta_e"] = path_kinetic_barrier_sum
-        candidate["ranking_score_source"] = "cumulative_ts_barrier_sum"
+        # Rate-determining-step proxy: the highest single-step barrier along the
+        # path governs the overall rate, not the sum of barriers.
+        candidate["ranking_score_delta_e"] = path_rate_limiting_barrier_e
+        candidate["ranking_score_source"] = "cumulative_rate_limiting_barrier"
     else:
         raise ValueError(f"Unknown sample score mode: {score_mode}")
 
@@ -464,6 +552,8 @@ def _ranking_exclusion_reason(
     *,
     score_mode: str,
     min_quality: str,
+    require_bond_change: bool = True,
+    max_abs_delta_e: float | None = DEFAULT_MAX_ABS_DELTA_E,
 ) -> str | None:
     if candidate.get("runtime_error"):
         return "runtime error"
@@ -472,11 +562,36 @@ def _ranking_exclusion_reason(
         return f"nonzero exit code {exit_code}"
     if candidate.get("product_xyz") is None:
         return "missing product XYZ"
+    if require_bond_change:
+        added = candidate.get("product_bond_added")
+        removed = candidate.get("product_bond_removed")
+        if added is not None and removed is not None and added + removed == 0:
+            return "null reaction: product bond graph identical to reactant"
+
+    # Out-of-distribution guard: an unphysical |dE| means the MLIP extrapolated
+    # badly (collapsed/dissociated geometry). Reject before it can win the
+    # Boltzmann weight or seed the next sampling iteration.
+    if max_abs_delta_e is not None and max_abs_delta_e > 0:
+        local_de = _finite_score(candidate.get("local_product_delta_e"))
+        if local_de is None:
+            local_de = _finite_score(candidate.get("product_delta_e"))
+        for label, value in (
+            ("step", local_de),
+            ("cumulative", _finite_score(candidate.get("path_product_delta_e"))),
+        ):
+            if value is not None and abs(value) > max_abs_delta_e:
+                return (
+                    f"implausible {label} dE {value:.1f} kcal/mol "
+                    f"(|dE| > {max_abs_delta_e:.0f}; likely MLIP out-of-domain)"
+                )
 
     status = str(candidate.get("status") or "")
     has_ts = bool(candidate.get("has_ts"))
-    if score_mode == "kinetic" and not has_ts:
-        return "kinetic ranking requires a unique TS"
+    if score_mode == "kinetic":
+        if not has_ts:
+            return "kinetic ranking requires a unique TS"
+        if not bool(candidate.get("path_all_steps_have_ts", has_ts)):
+            return "kinetic ranking requires a TS at every step of the path"
     score = _finite_score(candidate.get("ranking_score_delta_e"))
     if score is None:
         return "missing finite ranking score"
@@ -494,8 +609,53 @@ def _ranking_exclusion_reason(
     if min_quality == "ts":
         if status != "converged_ts" or not has_ts:
             return "converged TS candidate required"
+        # When frequency verification ran, demand a genuine first-order saddle.
+        verified = candidate.get("ts_is_first_order_saddle")
+        if verified is False:
+            count = candidate.get("ts_imaginary_mode_count")
+            return f"TS is not a first-order saddle ({count} imaginary modes)"
         return None
     raise ValueError(f"Unknown sample minimum quality: {min_quality}")
+
+
+def _dedupe_eligible_by_product(
+    eligible: list[tuple[dict, float]],
+) -> list[tuple[dict, float]]:
+    """Keep one representative per distinct product among eligible candidates.
+
+    Candidates reached by different driving coordinates often converge to the
+    same product; counting each separately inflates that product's Boltzmann
+    weight. Group by product bond signature and keep the best representative
+    (lowest ranking score, preferring verified/peaked TS), marking the rest
+    excluded so they still appear in the JSON with a reason.
+    """
+    groups: dict[tuple[str, ...], list[tuple[dict, float]]] = {}
+    survivors: list[tuple[dict, float]] = []
+    for candidate, score in eligible:
+        signature = candidate.get("product_bond_signature")
+        if not signature:
+            # No structural signature available; never merge these.
+            survivors.append((candidate, score))
+            continue
+        groups.setdefault(tuple(signature), []).append((candidate, score))
+
+    for members in groups.values():
+        members.sort(
+            key=lambda item: (
+                item[1],
+                not bool(item[0].get("has_ts")),
+                str(item[0].get("candidate_id")),
+            )
+        )
+        representative, rep_score = members[0]
+        survivors.append((representative, rep_score))
+        for candidate, _ in members[1:]:
+            candidate["ranking_included"] = False
+            candidate["ranking_exclusion_reason"] = (
+                f"duplicate product of {representative.get('candidate_id')}"
+            )
+            candidate["duplicate_of"] = representative.get("candidate_id")
+    return survivors
 
 
 def _ranked_population_view(
@@ -504,25 +664,34 @@ def _ranked_population_view(
     temperature: float,
     score_mode: str,
     min_quality: str,
+    require_bond_change: bool = True,
+    max_abs_delta_e: float | None = DEFAULT_MAX_ABS_DELTA_E,
+    dedupe_products: bool = True,
 ) -> list[dict]:
-    eligible_candidates: list[dict] = []
-    scores: list[float] = []
+    eligible: list[tuple[dict, float]] = []
     for candidate in candidates:
         reason = _ranking_exclusion_reason(
             candidate,
             score_mode=score_mode,
             min_quality=min_quality,
+            require_bond_change=require_bond_change,
+            max_abs_delta_e=max_abs_delta_e,
         )
         candidate["ranking_included"] = reason is None
         candidate["ranking_exclusion_reason"] = reason
+        candidate.pop("duplicate_of", None)
         if reason is not None:
             continue
         score = _finite_score(candidate.get("ranking_score_delta_e"))
         if score is None:
             continue
-        eligible_candidates.append(candidate)
-        scores.append(score)
+        eligible.append((candidate, score))
 
+    if dedupe_products:
+        eligible = _dedupe_eligible_by_product(eligible)
+
+    eligible_candidates = [candidate for candidate, _ in eligible]
+    scores = [score for _, score in eligible]
     populations = compute_boltzmann_populations(scores, temperature=temperature)
     rows: list[dict] = []
     for candidate, score, population in zip(eligible_candidates, scores, populations):
@@ -656,6 +825,14 @@ def run_sampled_product_search(
     sample_allow_shared_add_atoms: bool = False,
     sample_export_artifacts: bool = False,
     sample_reuse_calculator: bool = True,
+    sample_require_bond_change: bool = True,
+    sample_max_abs_delta_e: float | None = DEFAULT_MAX_ABS_DELTA_E,
+    sample_dedupe_products: bool = True,
+    sample_verify_ts: bool = False,
+    sample_all: bool = False,
+    sample_all_first_iteration: bool = False,
+    sample_resume: bool = True,
+    sample_pool_file: str | None = None,
 ) -> tuple[dict, Path, int]:
     if sample_iterations <= 0:
         raise ValueError("sample_iterations must be positive.")
@@ -677,6 +854,23 @@ def run_sampled_product_search(
         )
 
     parsed_sample_modes = parse_sample_modes(sample_modes)
+
+    # Optional curated driving-coordinate pool: a JSON file ({"sets": [...]} or a
+    # bare list) of driving-coordinate sets to use for the ROOT reactant (iteration
+    # 1) instead of the auto-enumerated/sampled graph pool. Used for the
+    # combustion-focused runs where only a handful of chemically-meaningful
+    # channels (H-abstraction by O2, O2 addition, beta-scission) are relevant.
+    curated_root_pool = None
+    if sample_pool_file:
+        raw = json.loads(Path(sample_pool_file).read_text())
+        raw_sets = raw["sets"] if isinstance(raw, dict) else raw
+        curated_root_pool = [
+            normalize_driving_coord_set(tuple(tuple(c) for c in cset))
+            for cset in raw_sets
+        ]
+        if not curated_root_pool:
+            raise ValueError(f"No driving-coordinate sets found in {sample_pool_file}")
+
     model_path = Path(model_path).resolve()
     initial_xyz_path = Path(xyz_file).resolve()
     run_dir = Path(run_dir).resolve()
@@ -712,6 +906,15 @@ def run_sampled_product_search(
                 "Could not initialize a shared ReactIP calculator for sampled "
                 f"search; candidates will report this runtime error: {shared_calculator_error}"
             )
+    # Absolute MLIP energy of the root reactant: the single reference for
+    # reaction energies along every sampled path.
+    root_abs_energy_ev = _absolute_energy_ev(shared_calculator, initial_xyz_path)
+    if shared_calculator is not None and root_abs_energy_ev is None:
+        print(
+            "  Warning: could not evaluate the root reactant energy; cumulative "
+            "thermodynamic scores will fall back to the stepwise estimate."
+        )
+
     frontier = [
         {
             "candidate_id": "root",
@@ -719,14 +922,87 @@ def run_sampled_product_search(
             "path_product_delta_e": 0.0,
             "path_kinetic_barrier_sum": 0.0,
             "path_rate_limiting_barrier_e": None,
+            "path_all_steps_have_ts": True,
             "path_candidate_ids": [],
         }
     ]
     next_run_id = start_run_id
     candidate_serial = 0
     started_at = perf_counter()
+    stopped_early = False
+    stop_reason: str | None = None
+    iterations_completed = 0
+
+    search_parameters_payload = {
+        "device": device or default_device(),
+        "charge": charge,
+        "multiplicity": multiplicity,
+        "adiabatic_state": adiabatic_state,
+        "num_nodes": num_nodes,
+        "max_gsm_iters": max_gsm_iters,
+        "max_opt_steps": max_opt_steps,
+        "conv_tol": conv_tol,
+        "optimizer": optimizer,
+        "coordinate_type": coordinate_type,
+        "rtype": rtype,
+        "max_force": max_force,
+        "max_abs_energy": max_abs_energy,
+        "reactant_geom_fixed": reactant_geom_fixed,
+        "start_run_id": start_run_id,
+        "sample_count_per_reactant": sample_count,
+        "sample_all_driving_coords": sample_all,
+        "sample_all_first_iteration": sample_all_first_iteration,
+        "sample_resume": sample_resume,
+        "sample_iterations": sample_iterations,
+        "resample_top_k": resample_top_k,
+        "print_top": print_top,
+        "temperature": temperature,
+        "sample_score_mode": sample_score_mode,
+        "sample_min_quality": sample_min_quality,
+        "sample_seed": sample_seed,
+        "sample_modes": list(parsed_sample_modes),
+        "sample_include_hydrogen": sample_include_hydrogen,
+        "sample_add_max_distance": sample_add_max_distance,
+        "sample_bond_scale": sample_bond_scale,
+        "sample_allow_shared_add_atoms": sample_allow_shared_add_atoms,
+        "sample_require_bond_change": sample_require_bond_change,
+        "sample_max_abs_delta_e": sample_max_abs_delta_e,
+        "sample_dedupe_products": sample_dedupe_products,
+        "sample_verify_ts": sample_verify_ts,
+        "sample_export_artifacts": sample_export_artifacts,
+        "reuse_shared_calculator": sample_reuse_calculator and shared_calculator is not None,
+        "root_abs_energy_ev": root_abs_energy_ev,
+        "shared_calculator_error": shared_calculator_error,
+    }
+
+    def _write_partial_search_summary() -> None:
+        """Persist progress so a wall-time kill never loses completed work.
+
+        The partial summary carries everything reporting needs (candidates so
+        far, per-iteration reports, parameters) and is overwritten by the final
+        summary on normal completion. ``search_in_progress`` marks partials.
+        """
+        partial = {
+            **metadata,
+            "search_in_progress": True,
+            "mlip_model_name": model_path.name,
+            "mlip_model_path": str(model_path),
+            "initial_xyz_file": str(initial_xyz_path),
+            "run_directory": str(run_dir),
+            "search_parameters": search_parameters_payload,
+            "iterations": iteration_reports,
+            "iterations_requested": sample_iterations,
+            "iterations_completed": iterations_completed,
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
+            "candidate_count": len(all_candidates),
+            "candidates": all_candidates,
+            "elapsed_seconds": perf_counter() - started_at,
+        }
+        write_summary_json(partial, run_dir / "candidate_search_summary.json")
 
     for iteration in range(1, sample_iterations + 1):
+        iterations_completed = iteration
         print()
         print(f"Sampling iteration {iteration}/{sample_iterations}")
         print(f"  Reactants in frontier: {len(frontier)}")
@@ -739,20 +1015,44 @@ def run_sampled_product_search(
             if sample_seed is not None:
                 seed = int(sample_seed) + iteration * 100000 + parent_index * 1000
 
-            sampled_sets = sample_driving_coordinate_sets(
-                parent_xyz,
-                sample_count=sample_count,
-                random_seed=seed,
+            pool_kwargs = dict(
                 include_hydrogen=sample_include_hydrogen,
                 max_add_distance=sample_add_max_distance,
                 bond_scale=sample_bond_scale,
                 modes=parsed_sample_modes,
                 allow_shared_add_atoms=sample_allow_shared_add_atoms,
             )
-            print(
-                f"  Parent {parent_id}: sampled {len(sampled_sets)} "
-                f"candidate(s) from {parent_xyz}"
+            use_curated = (
+                curated_root_pool is not None
+                and iteration == 1
+                and parent_index == 0
             )
+            exhaustive_now = sample_all or (
+                sample_all_first_iteration and iteration == 1
+            )
+            if use_curated:
+                # Curated combustion pool for the root reactant.
+                sampled_sets = curated_root_pool
+                print(
+                    f"  Parent {parent_id}: using {len(sampled_sets)} CURATED "
+                    f"driving-coordinate set(s) from {sample_pool_file}"
+                )
+            elif exhaustive_now:
+                # Exhaustive: run every enumerated driving-coordinate set (the
+                # full graph-enumeration pool), as in the RPS/Halo8 papers.
+                sampled_sets = generate_driving_coordinate_pool(parent_xyz, **pool_kwargs)
+                print(
+                    f"  Parent {parent_id}: enumerated ALL {len(sampled_sets)} "
+                    f"driving-coordinate set(s) from {parent_xyz}"
+                )
+            else:
+                sampled_sets = sample_driving_coordinate_sets(
+                    parent_xyz, sample_count=sample_count, random_seed=seed, **pool_kwargs
+                )
+                print(
+                    f"  Parent {parent_id}: sampled {len(sampled_sets)} of the "
+                    f"enumerated pool from {parent_xyz}"
+                )
 
             for sample_index, driving_coords in enumerate(sampled_sets, start=1):
                 candidate_serial += 1
@@ -773,7 +1073,29 @@ def run_sampled_product_search(
 
                 run_id = next_run_id
                 next_run_id += 1
-                if sample_reuse_calculator and shared_calculator is None:
+
+                # Resume support: when rerunning into the same output directory
+                # (e.g. after a wall-time kill), completed candidates are loaded
+                # from their summary.json instead of being recomputed. The pool
+                # and iteration structure are deterministic for a fixed seed, so
+                # candidate directories line up across restarts.
+                resumed = False
+                existing_summary = candidate_dir / "summary.json"
+                if sample_resume and existing_summary.exists():
+                    try:
+                        prior = json.loads(existing_summary.read_text())
+                    except Exception:
+                        prior = None
+                    if prior and prior.get("status"):
+                        summary = prior
+                        summary_path = existing_summary
+                        candidate_exit_code = 1 if prior.get("runtime_error") else 0
+                        resumed = True
+                        print(f"  [resume] {candidate_id}: loaded existing summary ({prior.get('status')})")
+
+                if resumed:
+                    pass
+                elif sample_reuse_calculator and shared_calculator is None:
                     summary = {
                         **metadata,
                         "status": "runtime_error_before_candidate_run",
@@ -820,6 +1142,7 @@ def run_sampled_product_search(
                         run_id=run_id,
                         export_artifacts=sample_export_artifacts,
                         calculator=shared_calculator if sample_reuse_calculator else None,
+                        verify_ts=sample_verify_ts,
                     )
 
                 product_xyz, product_warning = _write_product_xyz_from_summary(
@@ -830,6 +1153,27 @@ def run_sampled_product_search(
                 warnings = list(summary.get("warnings") or [])
                 if product_warning is not None:
                     warnings.append(product_warning)
+
+                product_bond_added = None
+                product_bond_removed = None
+                product_bond_signature = None
+                product_abs_energy_ev = None
+                if product_xyz is not None:
+                    try:
+                        product_bond_added, product_bond_removed = count_bond_changes(
+                            reactant_copy,
+                            product_xyz,
+                            scale=sample_bond_scale,
+                        )
+                        product_bond_signature = list(
+                            bond_signature(product_xyz, scale=sample_bond_scale)
+                        )
+                    except Exception as exc:
+                        warnings.append(f"Bond-change check failed: {exc}")
+                    product_abs_energy_ev = _absolute_energy_ev(
+                        shared_calculator if sample_reuse_calculator else None,
+                        product_xyz,
+                    )
 
                 candidate = {
                     "candidate_id": candidate_id,
@@ -854,18 +1198,35 @@ def run_sampled_product_search(
                     "score_delta_e": summary.get("score_delta_e"),
                     "score_delta_e_source": summary.get("score_delta_e_source"),
                     "product_xyz": product_xyz,
+                    "product_bond_added": product_bond_added,
+                    "product_bond_removed": product_bond_removed,
+                    "product_bond_signature": product_bond_signature,
+                    "product_abs_energy_ev": product_abs_energy_ev,
+                    "ts_imaginary_mode_count": summary.get("ts_imaginary_mode_count"),
+                    "ts_is_first_order_saddle": summary.get("ts_is_first_order_saddle"),
+                    "ts_imaginary_frequencies_cm": summary.get("ts_imaginary_frequencies_cm"),
+                    "ts_verification_error": summary.get("ts_verification_error"),
                     "runtime_error": summary.get("runtime_error"),
                     "warnings": warnings,
                 }
-                _annotate_candidate_path(candidate, parent, sample_score_mode)
+                _annotate_candidate_path(
+                    candidate,
+                    parent,
+                    sample_score_mode,
+                    root_abs_energy_ev=root_abs_energy_ev,
+                )
                 iteration_candidates.append(candidate)
                 all_candidates.append(candidate)
+                _write_partial_search_summary()
 
         ranked_iteration = _ranked_population_view(
             iteration_candidates,
             temperature=temperature,
             score_mode=sample_score_mode,
             min_quality=sample_min_quality,
+            require_bond_change=sample_require_bond_change,
+            max_abs_delta_e=sample_max_abs_delta_e,
+            dedupe_products=sample_dedupe_products,
         )
         _print_candidate_population_report(
             f"Top sampled candidates after iteration {iteration}",
@@ -894,13 +1255,21 @@ def run_sampled_product_search(
                 "path_product_delta_e": row.get("path_product_delta_e"),
                 "path_kinetic_barrier_sum": row.get("path_kinetic_barrier_sum"),
                 "path_rate_limiting_barrier_e": row.get("path_rate_limiting_barrier_e"),
+                "path_all_steps_have_ts": row.get("path_all_steps_have_ts", True),
                 "path_candidate_ids": row.get("path_candidate_ids") or [],
             }
             for row in ranked_iteration
             if row.get("product_xyz") is not None
         ][:resample_top_k]
         if not next_frontier:
-            print("  Stopping early: no ranked product XYZ files are available.")
+            if iteration < sample_iterations:
+                stopped_early = True
+                stop_reason = (
+                    f"no converged product carried forward after iteration {iteration} "
+                    f"of {sample_iterations}; multi-step path truncated by failed/"
+                    "non-converged candidates, not by design"
+                )
+                print(f"  Stopping early: {stop_reason}")
             break
         frontier = next_frontier
 
@@ -909,6 +1278,9 @@ def run_sampled_product_search(
         temperature=temperature,
         score_mode=sample_score_mode,
         min_quality=sample_min_quality,
+        require_bond_change=sample_require_bond_change,
+        max_abs_delta_e=sample_max_abs_delta_e,
+        dedupe_products=sample_dedupe_products,
     )
     print()
     _print_candidate_population_report(
@@ -924,44 +1296,19 @@ def run_sampled_product_search(
     elapsed_seconds = perf_counter() - started_at
     search_summary = {
         **metadata,
+        "search_in_progress": False,
         "mlip_model_name": model_path.name,
         "mlip_model_path": str(model_path),
         "initial_xyz_file": str(initial_xyz_path),
         "run_directory": str(run_dir),
-        "search_parameters": {
-            "device": device or default_device(),
-            "charge": charge,
-            "multiplicity": multiplicity,
-            "adiabatic_state": adiabatic_state,
-            "num_nodes": num_nodes,
-            "max_gsm_iters": max_gsm_iters,
-            "max_opt_steps": max_opt_steps,
-            "conv_tol": conv_tol,
-            "optimizer": optimizer,
-            "coordinate_type": coordinate_type,
-            "rtype": rtype,
-            "max_force": max_force,
-            "max_abs_energy": max_abs_energy,
-            "reactant_geom_fixed": reactant_geom_fixed,
-            "start_run_id": start_run_id,
-            "sample_count_per_reactant": sample_count,
-            "sample_iterations": sample_iterations,
-            "resample_top_k": resample_top_k,
-            "print_top": print_top,
-            "temperature": temperature,
-            "sample_score_mode": sample_score_mode,
-            "sample_min_quality": sample_min_quality,
-            "sample_seed": sample_seed,
-            "sample_modes": list(parsed_sample_modes),
-            "sample_include_hydrogen": sample_include_hydrogen,
-            "sample_add_max_distance": sample_add_max_distance,
-            "sample_bond_scale": sample_bond_scale,
-            "sample_allow_shared_add_atoms": sample_allow_shared_add_atoms,
-            "sample_export_artifacts": sample_export_artifacts,
-            "reuse_shared_calculator": sample_reuse_calculator and shared_calculator is not None,
-            "shared_calculator_error": shared_calculator_error,
-        },
+        "search_parameters": search_parameters_payload,
         "iterations": iteration_reports,
+        "iterations_requested": sample_iterations,
+        "iterations_completed": iterations_completed,
+        "max_path_depth": max((len(c.get("path_candidate_ids") or [])
+                               for c in ranked_all), default=0),
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
         "candidate_count": len(all_candidates),
         "ranked_candidate_count": len(ranked_all),
         "candidates": all_candidates,
@@ -992,7 +1339,44 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", required=True, help="Path to compiled model or checkpoint")
-    parser.add_argument("--xyz", required=True, help="Reactant XYZ file")
+    parser.add_argument(
+        "--xyz",
+        default=None,
+        help="Reactant XYZ file. Provide this OR --smiles (exactly one).",
+    )
+    parser.add_argument(
+        "--smiles",
+        default=None,
+        help=(
+            "Reactant SMILES instead of an XYZ file. A 3D reactant geometry is "
+            "generated with RDKit (ETKDG + MMFF) and written to the output dir. "
+            "Multiple molecules (e.g. a bimolecular reaction) may be given "
+            "dot-separated, e.g. 'C=CC=C.C=C'; each fragment is placed a few "
+            "Angstrom apart with contiguous per-molecule atom numbering. Inputs "
+            "are checked against the ReactIP MLIP domain (neutral, closed-shell, "
+            "elements CHNOFSSClBr)."
+        ),
+    )
+    parser.add_argument(
+        "--smiles-seed",
+        type=int,
+        default=42,
+        help="Deterministic RDKit embedding seed used when --smiles is given.",
+    )
+    parser.add_argument(
+        "--smiles-gap",
+        type=float,
+        default=4.0,
+        help=(
+            "Clear separation (Angstrom) between fragments when --smiles specifies "
+            "multiple molecules."
+        ),
+    )
+    parser.add_argument(
+        "--no-domain-check",
+        action="store_true",
+        help="Skip the MLIP-domain validation of --smiles input (not recommended).",
+    )
     parser.add_argument(
         "--isomers",
         default=None,
@@ -1012,25 +1396,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional provenance note stored in summary.json",
     )
     parser.add_argument("--device", default=default_device(), help="PyTorch device")
-    parser.add_argument("--charge", type=int, default=0, help="Molecular charge (v1 supports only 0)")
+    parser.add_argument(
+        "--charge",
+        type=int,
+        default=0,
+        help="Molecular charge (bookkeeping only; the MLIP has no charge input)",
+    )
     parser.add_argument(
         "--multiplicity",
         type=int,
         default=1,
-        help="Spin multiplicity (v1 supports only 1)",
+        help=(
+            "Spin multiplicity, e.g. 3 for a triplet O2 system (bookkeeping only; "
+            "the MLIP has no spin input so the PES matches the singlet run)"
+        ),
     )
     parser.add_argument(
         "--adiabatic-state",
         type=int,
         default=0,
-        help="Adiabatic state index (v1 supports only 0)",
+        help="Adiabatic state index (bookkeeping only; single-state MLIP)",
     )
-    parser.add_argument("--num-nodes", type=int, default=20, help="Max string nodes")
+    parser.add_argument(
+        "--num-nodes",
+        type=int,
+        default=30,
+        help="Max string nodes (validated default 30; was 20).",
+    )
     parser.add_argument("--max-iters", type=int, default=100, help="Max GSM iterations")
     parser.add_argument("--max-opt-steps", type=int, default=20, help="Max optimizer steps per cycle")
     parser.add_argument("--conv-tol", type=float, default=0.0005, help="TS convergence tolerance")
     parser.add_argument("--optimizer", default="eigenvector_follow", choices=["eigenvector_follow", "lbfgs"])
-    parser.add_argument("--coord-type", default="TRIC", choices=["TRIC", "DLC", "HDLC"])
+    parser.add_argument(
+        "--coord-type",
+        default="DLC",
+        choices=["TRIC", "DLC", "HDLC"],
+        help=(
+            "Internal-coordinate system. Validated default DLC (was TRIC); DLC is the "
+            "single biggest reliability improvement for multi-fragment reactions."
+        ),
+    )
     parser.add_argument(
         "--rtype",
         type=int,
@@ -1039,7 +1444,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="0=no climb, 1=climb only, 2=find+climb",
     )
     parser.add_argument("--no-pre-opt", action="store_true", help="Skip reactant pre-optimization")
-    parser.add_argument("--max-force", type=float, default=100.0, help="Safety cutoff for |F| in eV/A")
+    parser.add_argument(
+        "--max-force",
+        type=float,
+        default=500.0,
+        help="Safety cutoff for |F| in eV/A (validated default 500; was 100).",
+    )
     parser.add_argument("--max-abs-energy", type=float, default=10000.0, help="Safety cutoff for |E| in eV")
     parser.add_argument(
         "--output-dir",
@@ -1058,7 +1468,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-count",
         type=int,
         default=10,
-        help="Number of candidate products sampled per frontier reactant.",
+        help="Number of candidate products sampled per frontier reactant (ignored with --sample-all).",
+    )
+    sampling.add_argument(
+        "--sample-all",
+        action="store_true",
+        help=(
+            "Exhaustively run every enumerated driving-coordinate set per "
+            "reactant (full graph enumeration, as in the RPS/Halo8 papers) "
+            "instead of a random --sample-count subset. Much more expensive."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-all-first",
+        action="store_true",
+        help=(
+            "Exhaustively enumerate driving coordinates for the FIRST iteration "
+            "only; later iterations fall back to the random --sample-count "
+            "subset. Good default for multi-step searches: full first-step "
+            "coverage at bounded total cost."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-pool-file",
+        default=None,
+        help=(
+            "Path to a JSON file ({\"sets\": [[[op,a,b],...],...]} or a bare "
+            "list) of curated driving-coordinate sets to use for the ROOT "
+            "reactant (iteration 1) instead of the auto-enumerated/sampled "
+            "graph pool. Atom indices are 1-based. Used by "
+            "scripts/combustion_driving_coords.py for combustion runs."
+        ),
+    )
+    sampling.add_argument(
+        "--no-sample-resume",
+        action="store_true",
+        help=(
+            "Disable resume-from-existing-candidate-directories. By default a "
+            "rerun into the same output directory loads completed candidates "
+            "from their summary.json instead of recomputing them (useful after "
+            "a wall-time kill)."
+        ),
     )
     sampling.add_argument(
         "--sample-iterations",
@@ -1096,10 +1546,14 @@ def build_parser() -> argparse.ArgumentParser:
     sampling.add_argument(
         "--sample-min-quality",
         choices=SAMPLE_MIN_QUALITY_LEVELS,
-        default="converged",
+        default="completed",
         help=(
-            "Minimum candidate quality included in ranking. Use finite only for "
-            "exploratory smokes; production defaults to converged."
+            "Minimum candidate quality included in ranking "
+            "(finite < completed < converged < ts). Validated default 'completed' "
+            "(was 'converged'): 'converged' rejects the common "
+            "'ran_out_with_ts_candidate' status and can filter out even a correct TS, "
+            "which is what produced '0/10' in the GUI-team test. Use 'converged'/'ts' "
+            "to be stricter, 'finite' only for exploratory smokes."
         ),
     )
     sampling.add_argument(
@@ -1136,6 +1590,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow two-ADD candidates where both new bonds share an atom.",
     )
     sampling.add_argument(
+        "--sample-allow-unchanged-products",
+        action="store_true",
+        help=(
+            "Allow null-reaction candidates (product bond graph identical to the "
+            "reactant) to be ranked. By default they are excluded because their "
+            "near-zero dE otherwise dominates the Boltzmann populations."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-max-abs-delta-e",
+        type=float,
+        default=DEFAULT_MAX_ABS_DELTA_E,
+        help=(
+            "Reject candidates whose step or cumulative |dE| (kcal/mol) exceeds "
+            "this bound as MLIP out-of-domain artifacts. Set to 0 to disable."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-no-dedupe-products",
+        action="store_true",
+        help=(
+            "Disable product de-duplication. By default candidates that reach the "
+            "same product (identical bond graph) are merged before Boltzmann "
+            "normalization so degenerate products are not double-counted."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-verify-ts",
+        action="store_true",
+        help=(
+            "Confirm each unique TS with an MLIP finite-difference Hessian "
+            "(single imaginary frequency). Adds ~6N gradient evaluations per TS "
+            "candidate but verifies first-order saddles, as in the RPS pipeline."
+        ),
+    )
+    sampling.add_argument(
+        "--no-report",
+        action="store_true",
+        help=(
+            "Skip the automatic figure/report generation after the sampled search. "
+            "Raw outputs are always written; figures can be regenerated separately "
+            "with scripts/report_sampled_search.py."
+        ),
+    )
+    sampling.add_argument(
+        "--report-no-gif",
+        action="store_true",
+        help="When generating the report, skip GIF rendering (faster).",
+    )
+    sampling.add_argument(
+        "--report-gif-seconds",
+        type=float,
+        default=1.0,
+        help="Seconds per trajectory-GIF frame in the report (larger = slower).",
+    )
+    sampling.add_argument(
         "--sample-export-artifacts",
         action="store_true",
         help="Export SDF/GIF artifacts for every sampled candidate.",
@@ -1153,6 +1663,33 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     run_dir = Path(args.output_dir).resolve() if args.output_dir else Path.cwd().resolve()
+
+    # --- Input resolution: exactly one of --xyz / --smiles ---------------------
+    if bool(args.xyz) == bool(args.smiles):
+        parser.error("Provide exactly one of --xyz or --smiles.")
+
+    if args.smiles:
+        try:
+            from reactip.smiles import smiles_to_reactant_xyz, DomainError
+        except ImportError as exc:
+            parser.error(f"--smiles requires RDKit: {exc}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        generated_xyz = run_dir / "reactant_from_smiles.xyz"
+        try:
+            xyz_text = smiles_to_reactant_xyz(
+                args.smiles,
+                seed=args.smiles_seed,
+                gap=args.smiles_gap,
+                validate=not args.no_domain_check,
+            )
+        except DomainError as exc:
+            parser.error(str(exc))
+        except ValueError as exc:  # SmilesConversionError and friends
+            parser.error(f"SMILES -> XYZ conversion failed: {exc}")
+        generated_xyz.write_text(xyz_text)
+        args.xyz = str(generated_xyz)
+        print(f"Generated reactant geometry from SMILES {args.smiles!r}")
+        print(f"  -> {generated_xyz}")
 
     if not args.sample_products and not args.isomers:
         parser.error("--isomers is required unless --sample-products is set.")
@@ -1216,10 +1753,42 @@ def main(argv: list[str] | None = None) -> None:
             sample_allow_shared_add_atoms=args.sample_allow_shared_add_atoms,
             sample_export_artifacts=args.sample_export_artifacts,
             sample_reuse_calculator=not args.sample_reload_model_each_candidate,
+            sample_require_bond_change=not args.sample_allow_unchanged_products,
+            sample_max_abs_delta_e=args.sample_max_abs_delta_e,
+            sample_dedupe_products=not args.sample_no_dedupe_products,
+            sample_verify_ts=args.sample_verify_ts,
+            sample_all=args.sample_all,
+            sample_all_first_iteration=args.sample_all_first,
+            sample_resume=not args.no_sample_resume,
+            sample_pool_file=args.sample_pool_file,
         )
         print()
         print(f"Candidate search summary JSON : {summary_path}")
         print(f"Candidate count               : {summary['candidate_count']}")
+
+        # Default: also generate figures/report from the raw outputs just written.
+        # This is the "compute + plot" default; the same reporting can be re-run
+        # standalone via scripts/report_sampled_search.py.
+        if not args.no_report:
+            try:
+                from reactip.reporting import generate_sampled_search_report
+
+                print("\nGenerating figures and report from raw outputs ...")
+                result = generate_sampled_search_report(
+                    summary_path,
+                    make_gif=not args.report_no_gif,
+                    candidate_figures=True,
+                    gif_seconds=args.report_gif_seconds,
+                    progress=True,
+                )
+                print(f"Report written                : {result['report']}")
+                print(f"Search figures                : {result['figures_dir']}")
+            except Exception as exc:
+                print(
+                    f"\n[warn] Report generation failed ({exc.__class__.__name__}: {exc}). "
+                    "Raw outputs are intact; rerun scripts/report_sampled_search.py "
+                    f"--run-dir {run_dir}"
+                )
         raise SystemExit(exit_code)
 
     summary, summary_path, exit_code = run_with_reporting(

@@ -5,6 +5,12 @@ This document describes the sampled reaction-path search implemented in
 sample possible product-forming driving coordinates, rank the candidates, and
 optionally continue from the top products to build two-step or three-step paths.
 
+For a shorter sendable README-style version, see
+[`docs/sampled_product_search.md`](sampled_product_search.md).
+
+For Slurm arrays, CSV tables, analysis plots, structure panels, and GIF reports,
+see [`docs/sampled_search_workflow.md`](sampled_search_workflow.md).
+
 ## What it does
 
 Given one reactant XYZ structure, sampled mode:
@@ -39,12 +45,15 @@ python run_se_gsm.py \
     --resample-top-k 3 \
     --print-top 5 \
     --sample-score-mode thermodynamic \
-    --sample-min-quality converged \
     --device cuda \
     --output-dir runs/sample_search
 ```
 
-This samples up to 10 candidate reactions per frontier reactant. After each
+The reliability-critical settings `--coord-type DLC`, `--max-force 500`,
+`--num-nodes 30`, and `--sample-min-quality completed` are now the **defaults**
+(previously `TRIC` / `100` / `20` / `converged`), so they no longer need to be
+passed explicitly. All remain overridable. This samples up to 10 candidate
+reactions per frontier reactant. After each
 iteration, the top 3 ranked product geometries become the reactants for the next
 iteration. With the defaults above, the search can therefore explore up to three
 reaction steps.
@@ -89,6 +98,20 @@ SE-GSM still decides whether a candidate is usable. Invalid, failed, or
 low-quality candidates are recorded in the summary and excluded from production
 ranking by default.
 
+### Sampled subset vs. exhaustive enumeration
+
+By default the generated pool is **subsampled**: `--sample-count N` draws a
+random (seeded) subset of `N` coordinate sets per reactant. This is the
+"sampled" in sampled-product search and trades coverage for speed — the printed
+populations are then relative to the sampled subset, not the full pool. To
+reproduce the original RPS/Halo8 behavior, which enumerates *all* driving
+coordinates from the reactant graph and runs every one, pass `--sample-all`
+(it ignores `--sample-count` and runs the entire enumerated pool per reactant).
+Exhaustive mode is much more expensive, especially with multiple iterations, so
+it is best used with `--sample-iterations 1` for a single-step product search.
+The full pool size for a given reactant is the number returned by
+`generate_driving_coordinate_pool` in `reactip/sampling.py`.
+
 ## Ranking and populations
 
 The printed population is normalized over ranked candidates with:
@@ -103,10 +126,15 @@ The default score mode is:
 --sample-score-mode thermodynamic
 ```
 
-In this mode, `dE` is the cumulative product energy relative to the original
-root reactant. Cumulative scoring is important for two-step and three-step
-sampling because candidates from different parent products do not share the same
-local energy reference.
+In this mode, `dE` is the product energy relative to the original root reactant.
+When the shared calculator is active (the default), this is computed from
+**absolute MLIP energies**: `dE = E(product) - E(root reactant)`, evaluated on a
+single consistent energy scale (`ranking_score_source = absolute_product_delta_e_vs_root`).
+This is the correct reference for multi-step paths because each product is
+re-optimized when it becomes the next reactant; summing per-step `dE` would drop
+the relaxation energy at every hand-off. If absolute energies are unavailable
+(e.g. `--sample-reload-model-each-candidate`), the code falls back to the
+telescoped per-step sum (`cumulative_product_delta_e_stepwise`).
 
 The alternative mode is:
 
@@ -114,9 +142,50 @@ The alternative mode is:
 --sample-score-mode kinetic
 ```
 
-This uses a TST-like proxy based on cumulative TS barriers. It only ranks
-candidates where SE-GSM identifies a unique TS. It should be treated as a
-screening proxy, not a full rate calculation.
+This ranks by the **rate-limiting (largest single-step) TS barrier** along the
+path — the rate-determining step governs the overall rate, not the sum of
+barriers. It only ranks paths where SE-GSM found a unique TS at *every* step.
+It is a screening proxy, not a full rate calculation; for a rigorous multi-step
+rate, an energetic-span (Kozuch–Shaik) analysis on DFT-refined intermediates and
+TSs is the appropriate follow-up.
+
+### Out-of-domain guard
+
+```text
+--sample-max-abs-delta-e 500.0   # kcal/mol; 0 disables
+```
+
+A pretrained MLIP can return unphysical energies for geometries outside its
+training distribution (collapsed or dissociated structures). Such a candidate
+would otherwise have an enormous negative `dE`, capture ~100% of the Boltzmann
+weight, and seed the next iteration. Candidates whose step or cumulative `|dE|`
+exceeds this bound are excluded with reason `implausible ... dE ... (likely MLIP
+out-of-domain)`. The default 500 kcal/mol is far above any real reaction energy
+for the in-domain small molecules while still catching extrapolation failures.
+
+### Product de-duplication
+
+Different driving coordinates frequently converge to the **same** product. By
+default such candidates are merged by product bond graph before the Boltzmann
+normalization (the best-scoring representative is kept; the rest are recorded
+with reason `duplicate product of <id>`). This prevents a degenerate product
+from being counted several times and inflating its apparent population. Disable
+with `--sample-no-dedupe-products`.
+
+### Transition-state verification
+
+```text
+--sample-verify-ts
+```
+
+SE-GSM's `converged_ts` only means the optimized string had a single energy
+peak. With `--sample-verify-ts`, each unique TS node is confirmed with an MLIP
+finite-difference Hessian: the geometry is a genuine first-order saddle only if
+it has exactly one imaginary frequency (above a 50 cm^-1 noise threshold). The
+result is stored as `ts_imaginary_mode_count` / `ts_is_first_order_saddle`, and
+`--sample-min-quality ts` then requires a verified saddle. This reproduces the
+TS criterion used in the RPS/Halo8 reference pipelines at MLIP cost
+(~6N gradient evaluations per TS).
 
 Candidate quality is controlled by:
 
@@ -127,12 +196,27 @@ Candidate quality is controlled by:
 Recommended default:
 
 ```text
---sample-min-quality converged
+--sample-min-quality completed
 ```
 
-Use `finite` only for debugging or smoke tests because it may include early-ended
-strings that have finite endpoint energies but are not production-quality
+`completed` is the current default. It admits `completed_*` and `converged_*`
+statuses, including the common `ran_out_with_ts_candidate` (a TS was found but
+the string did not fully converge in the node budget) — which `converged` would
+reject, and which was the cause of the `0/10` result in the GUI team's test. Use
+`converged` or `ts` to be stricter. Use `finite` only for debugging or smoke
+tests because it may include early-ended strings that have finite endpoint
+energies but are not production-quality
 reaction candidates.
+
+Null reactions are excluded from ranking by default. A candidate whose product
+bond graph is identical to its reactant (no bonds formed or broken at the
+covalent-radius cutoff) is recorded with exclusion reason
+`null reaction: product bond graph identical to reactant`. Without this filter,
+strings that relax back to the reactant basin have near-zero `dE` and dominate
+the Boltzmann populations, so multi-step searches stall in place. Use
+`--sample-allow-unchanged-products` to restore the old behavior, e.g. when
+conformational (non-bond-changing) steps are of interest. The per-candidate
+counts are stored as `product_bond_added` / `product_bond_removed`.
 
 ## Console output
 

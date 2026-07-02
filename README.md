@@ -87,13 +87,17 @@ python run_se_gsm.py \
     --resample-top-k 3 \
     --print-top 5 \
     --sample-score-mode thermodynamic \
-    --sample-min-quality converged \
     --device cuda \
     --output-dir runs/sample_search
 ```
 
-By default, sampled searches rank only converged candidates. The default
-`--sample-score-mode thermodynamic` reports equilibrium-like product populations
+The reliability-critical settings — `--coord-type DLC`, `--max-force 500`,
+`--num-nodes 30`, `--sample-min-quality completed` — are now the **defaults**, so
+the command above uses them without needing the flags. (Before this update the
+defaults were `TRIC` / `100` / `20` / `converged`, which is what produced the
+force-threshold errors and `0/10` result in early tests.) All values remain
+overridable; pass `--sample-min-quality converged` (or `ts`) to be stricter. The
+default `--sample-score-mode thermodynamic` reports equilibrium-like product populations
 with weights proportional to `exp(-dE / RT)`, where `dE` is the cumulative
 product energy relative to the original root reactant. This cumulative score is
 important for two-step and three-step searches because products sampled from
