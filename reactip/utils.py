@@ -20,27 +20,53 @@ _COVALENT_RADII = {
     "Br": 1.20,
 }
 
+# CPK-style atom colors for the shaded-sphere ball-and-stick renderer.
 _ELEMENT_COLORS = {
-    "H": "#f3f4f6",
-    "C": "#1f2937",
-    "N": "#2563eb",
-    "O": "#dc2626",
-    "F": "#10b981",
-    "S": "#d97706",
-    "Cl": "#16a34a",
-    "Br": "#92400e",
+    "H": "#f2f2f2",
+    "C": "#262626",
+    "N": "#2f63d6",
+    "O": "#e6402c",
+    "F": "#33cc55",
+    "S": "#e0c020",
+    "Cl": "#28b828",
+    "Br": "#a0522d",
 }
 
-_ELEMENT_SIZES = {
-    "H": 120,
-    "C": 180,
-    "N": 200,
-    "O": 200,
-    "F": 220,
-    "S": 260,
-    "Cl": 320,
-    "Br": 360,
+# Reference bond lengths (Angstrom): (single, double, triple|None); keys are sorted
+# element pairs. A measured length below the single/double midpoint is drawn as a
+# double bond, below the double/triple midpoint as a triple. Pairs not listed (and
+# any bond involving H) are always single. This length heuristic is robust on the
+# fragment / radical / transition-state geometries along a reaction string, where
+# full valence perception (e.g. RDKit) tends to fail.
+_BOND_REF = {
+    ("C", "C"): (1.54, 1.34, 1.20),
+    ("C", "N"): (1.47, 1.28, 1.16),
+    ("C", "O"): (1.43, 1.21, 1.13),
+    ("N", "N"): (1.45, 1.25, 1.10),
+    ("N", "O"): (1.41, 1.21, None),
+    ("O", "O"): (1.48, 1.21, None),
+    ("C", "S"): (1.82, 1.60, None),
 }
+
+# Ball-and-stick rendering parameters.
+_DEFAULT_COLOR = "#9a9a9a"
+_DEFAULT_RADIUS = 0.77        # covalent-radius fallback (also used for bond detection)
+_ATOM_SCALE = 0.45            # sphere radius as a fraction of the covalent radius
+_MULTI_OFFSET = 0.26          # half-separation (A) between parallel double/triple sticks
+_BOND_LW = 2.2                # single-bond stick core width (points); higher orders thinner
+_H_BOND_FACTOR = 0.62         # bonds to H drawn this fraction as thick (thinner than H ball)
+_OUTLINE_EXTRA = 0.8          # dark halo width added around each stick core (points)
+_ELEV, _AZIM = 20.0, 38.0     # default camera orientation
+_BOND_ORDER_WIDTH = {1: 1.0, 2: 0.78, 3: 0.64}        # stick width ratio per bond order
+_BOND_ORDER_SHIFTS = {1: (0.0,), 2: (-1.0, 1.0), 3: (-1.0, 0.0, 1.0)}
+
+# Unit-sphere parametric mesh, reused (scaled/translated) for every atom.
+_SPHERE_NU, _SPHERE_NV = 22, 16
+_sphere_u = np.linspace(0.0, 2.0 * np.pi, _SPHERE_NU)
+_sphere_v = np.linspace(0.0, np.pi, _SPHERE_NV)
+_SPHERE_X = np.outer(np.cos(_sphere_u), np.sin(_sphere_v))
+_SPHERE_Y = np.outer(np.sin(_sphere_u), np.sin(_sphere_v))
+_SPHERE_Z = np.outer(np.ones_like(_sphere_u), np.cos(_sphere_v))
 
 
 @dataclass(frozen=True)
@@ -153,18 +179,43 @@ def find_preferred_trajectory_source(run_dir: str | Path, run_id: int) -> Path:
     )
 
 
-def infer_bonds(frame: TrajectoryFrame, scale: float = 1.20) -> list[tuple[int, int]]:
-    bonds: list[tuple[int, int]] = []
-    for i, symbol_i in enumerate(frame.symbols):
-        radius_i = _COVALENT_RADII.get(symbol_i, 0.77)
-        for j in range(i + 1, len(frame.symbols)):
-            symbol_j = frame.symbols[j]
-            radius_j = _COVALENT_RADII.get(symbol_j, 0.77)
-            cutoff = scale * (radius_i + radius_j)
-            distance = float(np.linalg.norm(frame.coordinates[i] - frame.coordinates[j]))
-            if distance <= cutoff:
-                bonds.append((i, j))
+def bonds_with_order(
+    frame: TrajectoryFrame, scale: float = 1.20
+) -> list[tuple[int, int, int]]:
+    """Detected bonds as ``(i, j, order)`` with ``order`` in {1, 2, 3}.
+
+    Connectivity is the usual covalent-radius distance test; the order is then
+    assigned from the bond length relative to the reference single/double/triple
+    lengths for that element pair (see ``_BOND_REF``). Bonds to hydrogen and
+    unlisted pairs are always single.
+    """
+    symbols = frame.symbols
+    coords = frame.coordinates
+    bonds: list[tuple[int, int, int]] = []
+    for i, symbol_i in enumerate(symbols):
+        radius_i = _COVALENT_RADII.get(symbol_i, _DEFAULT_RADIUS)
+        for j in range(i + 1, len(symbols)):
+            symbol_j = symbols[j]
+            radius_j = _COVALENT_RADII.get(symbol_j, _DEFAULT_RADIUS)
+            distance = float(np.linalg.norm(coords[i] - coords[j]))
+            if not (0.4 < distance <= scale * (radius_i + radius_j)):
+                continue
+            order = 1
+            if "H" not in (symbol_i, symbol_j):
+                ref = _BOND_REF.get(tuple(sorted((symbol_i, symbol_j))))
+                if ref is not None:
+                    single, double, triple = ref
+                    if triple is not None and distance <= (double + triple) / 2.0:
+                        order = 3
+                    elif distance <= (single + double) / 2.0:
+                        order = 2
+            bonds.append((i, j, order))
     return bonds
+
+
+def infer_bonds(frame: TrajectoryFrame, scale: float = 1.20) -> list[tuple[int, int]]:
+    """Connectivity only (no bond order); see :func:`bonds_with_order`."""
+    return [(i, j) for i, j, _order in bonds_with_order(frame, scale)]
 
 
 def write_trajectory_sdf(
@@ -221,12 +272,161 @@ def write_trajectory_sdf(
     return output_path
 
 
+def _shift_color(color, fraction: float):
+    """Lighten (fraction > 0) or darken (fraction < 0) a color toward white/black."""
+    import matplotlib.colors as mcolors
+
+    rgb = np.array(mcolors.to_rgb(color))
+    if fraction < 0:
+        return tuple(rgb * (1.0 + fraction))
+    return tuple(rgb + (1.0 - rgb) * fraction)
+
+
+def _camera_matrix(elev_deg: float, azim_deg: float) -> np.ndarray:
+    """World->screen rotation, used to light spheres and offset multi-bonds."""
+    elev, azim = np.radians(elev_deg), np.radians(azim_deg)
+    ca, sa = np.cos(azim), np.sin(azim)
+    rz = np.array([[ca, sa, 0.0], [-sa, ca, 0.0], [0.0, 0.0, 1.0]])
+    ce, se = np.cos(elev), np.sin(elev)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, ce, se], [0.0, -se, ce]])
+    return rx @ rz
+
+
+def _sphere_facecolors(color, cam: np.ndarray) -> np.ndarray:
+    """Per-face RGB for the unit-sphere mesh, lit from the viewer's upper-left."""
+    import matplotlib.colors as mcolors
+
+    rgb = np.array(mcolors.to_rgb(color))
+    normals = np.stack(
+        [_SPHERE_X[:-1, :-1], _SPHERE_Y[:-1, :-1], _SPHERE_Z[:-1, :-1]], axis=-1
+    )
+    in_view = normals @ cam.T
+    light = np.array([-0.5, 0.5, 0.7])
+    light /= np.linalg.norm(light)
+    diffuse = np.clip(in_view @ light, 0.0, 1.0)
+    shade = 0.32 + 0.68 * diffuse
+    spec = diffuse ** 30
+    return np.clip(
+        rgb[None, None, :] * shade[..., None] + spec[..., None] * 0.85, 0.0, 1.0
+    )
+
+
+def _draw_stick(ax, start: np.ndarray, end: np.ndarray, color, linewidth: float) -> None:
+    """One half-bond segment: thin dark outline + element-colored core."""
+    ax.plot(
+        [start[0], end[0]], [start[1], end[1]], [start[2], end[2]],
+        color=_shift_color(color, -0.4), lw=linewidth + _OUTLINE_EXTRA,
+        solid_capstyle="round",
+    )
+    ax.plot(
+        [start[0], end[0]], [start[1], end[1]], [start[2], end[2]],
+        color=color, lw=linewidth, solid_capstyle="round",
+    )
+
+
+def _render_structure_3d(
+    ax,
+    frame: TrajectoryFrame,
+    *,
+    center: np.ndarray,
+    radius: float,
+    elev: float = _ELEV,
+    azim: float = _AZIM,
+    atom_scale: float = _ATOM_SCALE,
+    multi_offset: float = _MULTI_OFFSET,
+    bond_lw: float = _BOND_LW,
+    h_bond_factor: float = _H_BOND_FACTOR,
+    show_labels: bool = True,
+    label_h: bool = False,
+) -> None:
+    """Draw one frame as shaded ball-and-stick (with bond orders) into a 3D axes.
+
+    Atoms are shaded spheres (``plot_surface``); bonds are split half/half by
+    element; double / triple bonds are drawn as 2 / 3 parallel sticks offset in
+    the screen plane. The familiar 3D box / panes / dotted grid / x-y-z axes are
+    applied here too, so the camera and world extent stay fixed across frames.
+    """
+    import matplotlib.patheffects as pe
+
+    symbols = frame.symbols
+    coords = frame.coordinates
+    cam = _camera_matrix(elev, azim)
+    view_dir = cam[2, :]                          # world direction toward the viewer
+
+    # Bonds first, so atom spheres sort in front of the sticks they connect.
+    for i, j, order in bonds_with_order(frame):
+        p, q = coords[i], coords[j]
+        color_i = _ELEMENT_COLORS.get(symbols[i], _DEFAULT_COLOR)
+        color_j = _ELEMENT_COLORS.get(symbols[j], _DEFAULT_COLOR)
+        axis_vec = q - p
+        norm = float(np.linalg.norm(axis_vec))
+        axis_vec = axis_vec / norm if norm > 1e-6 else axis_vec
+        perp = np.cross(axis_vec, view_dir)        # perpendicular to bond, in screen plane
+        perp_norm = float(np.linalg.norm(perp))
+        perp = perp / perp_norm if perp_norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+        linewidth = bond_lw * _BOND_ORDER_WIDTH[order]
+        if "H" in (symbols[i], symbols[j]):        # keep C-H sticks thinner than the H ball
+            linewidth *= h_bond_factor
+        for shift in _BOND_ORDER_SHIFTS[order]:
+            offset = perp * shift * multi_offset
+            start, end = p + offset, q + offset
+            mid = (start + end) / 2.0
+            _draw_stick(ax, start, mid, color_i, linewidth)
+            _draw_stick(ax, mid, end, color_j, linewidth)
+
+    for index, symbol in enumerate(symbols):
+        r = atom_scale * _COVALENT_RADII.get(symbol, _DEFAULT_RADIUS)
+        x0, y0, z0 = coords[index]
+        facecolors = _sphere_facecolors(_ELEMENT_COLORS.get(symbol, _DEFAULT_COLOR), cam)
+        ax.plot_surface(
+            _SPHERE_X * r + x0, _SPHERE_Y * r + y0, _SPHERE_Z * r + z0,
+            facecolors=facecolors, rstride=1, cstride=1, linewidth=0,
+            antialiased=True, shade=False, zsort="max",
+        )
+        if show_labels and (label_h or symbol != "H"):
+            text = ax.text(
+                x0, y0, z0, symbol, ha="center", va="center", zorder=1e4,
+                fontsize=8.5 if symbol != "H" else 6.5, color="white", fontweight="bold",
+            )
+            text.set_path_effects([
+                pe.withStroke(
+                    linewidth=1.8,
+                    foreground=_shift_color(_ELEMENT_COLORS.get(symbol, _DEFAULT_COLOR), -0.6),
+                )
+            ])
+
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1, 1, 1))
+    tick_offsets = np.linspace(-0.7 * radius, 0.7 * radius, 3)
+    ax.set_xticks(np.round(center[0] + tick_offsets, 1))
+    ax.set_yticks(np.round(center[1] + tick_offsets, 1))
+    ax.set_zticks(np.round(center[2] + tick_offsets, 1))
+    ax.set_xlabel("x [Å]", fontsize=9, labelpad=6)
+    ax.set_ylabel("y [Å]", fontsize=9, labelpad=6)
+    ax.set_zlabel("z [Å]", fontsize=9, labelpad=6)
+    ax.tick_params(labelsize=8, pad=1, colors="#475569")
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.pane.set_facecolor((1.0, 1.0, 1.0, 0.0))
+        axis.pane.set_edgecolor((0.80, 0.84, 0.89, 1.0))
+        axis._axinfo["grid"].update(
+            {"linewidth": 0.7, "linestyle": ":", "color": "#cbd5e1"}
+        )
+
+
 def render_trajectory_gif(
     trajectory: MoldenTrajectory,
     output_path: str | Path,
     *,
     title: str,
     duration: float = 0.85,
+    elev: float = _ELEV,
+    azim: float = _AZIM,
+    atom_scale: float = _ATOM_SCALE,
+    show_labels: bool = True,
+    label_h: bool = False,
 ) -> Path:
     try:
         import imageio.v2 as imageio
@@ -285,51 +485,18 @@ def render_trajectory_gif(
         stats_ax.set_facecolor("#eef2f7")
         energy_ax.set_facecolor("white")
 
-        bonds = infer_bonds(frame)
-        for a, b in bonds:
-            xyz = frame.coordinates[[a, b]]
-            ax.plot(
-                xyz[:, 0],
-                xyz[:, 1],
-                xyz[:, 2],
-                color="#94a3b8",
-                linewidth=2.6,
-                alpha=0.95,
-            )
-
-        for atom_index, symbol in enumerate(frame.symbols):
-            coord = frame.coordinates[atom_index]
-            ax.scatter(
-                coord[0],
-                coord[1],
-                coord[2],
-                s=_ELEMENT_SIZES.get(symbol, 180) * 1.15,
-                c=_ELEMENT_COLORS.get(symbol, "#6b7280"),
-                edgecolors="black",
-                linewidths=0.7,
-                depthshade=True,
-            )
-
-        ax.view_init(elev=20, azim=38)
-        ax.set_xlim(center[0] - radius, center[0] + radius)
-        ax.set_ylim(center[1] - radius, center[1] + radius)
-        ax.set_zlim(center[2] - radius, center[2] + radius)
-        ax.set_box_aspect((1, 1, 1))
-        tick_offsets = np.linspace(-0.7 * radius, 0.7 * radius, 3)
-        ax.set_xticks(np.round(center[0] + tick_offsets, 1))
-        ax.set_yticks(np.round(center[1] + tick_offsets, 1))
-        ax.set_zticks(np.round(center[2] + tick_offsets, 1))
-        ax.set_xlabel("x [A]", fontsize=9, labelpad=6)
-        ax.set_ylabel("y [A]", fontsize=9, labelpad=6)
-        ax.set_zlabel("z [A]", fontsize=9, labelpad=6)
-        ax.tick_params(labelsize=8, pad=1, colors="#475569")
+        _render_structure_3d(
+            ax,
+            frame,
+            center=center,
+            radius=radius,
+            elev=elev,
+            azim=azim,
+            atom_scale=atom_scale,
+            show_labels=show_labels,
+            label_h=label_h,
+        )
         ax.set_title(title, fontsize=14, pad=16)
-        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-            axis.pane.set_facecolor((1.0, 1.0, 1.0, 0.0))
-            axis.pane.set_edgecolor((0.80, 0.84, 0.89, 1.0))
-            axis._axinfo["grid"].update(
-                {"linewidth": 0.7, "linestyle": ":", "color": "#cbd5e1"}
-            )
 
         energy_label = "n/a"
         if frame.energy_kcal_mol is not None:

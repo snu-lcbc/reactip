@@ -90,6 +90,47 @@ def infer_bond_pairs(
     return bonds
 
 
+def bond_signature(xyz_path: str | Path, *, scale: float = 1.20) -> tuple[str, ...]:
+    """Return a hashable element-aware bond signature for one structure.
+
+    Atom ordering is preserved throughout the sampled search (products are
+    copied forward as the next reactant), so two structures that share this
+    signature have the same covalent connectivity and are treated as the same
+    product species for de-duplication.
+    """
+    symbols, coordinates = read_xyz_frame(xyz_path)
+    bonds = infer_bond_pairs(symbols, coordinates, scale=scale)
+    return tuple(
+        sorted(f"{symbols[i]}{i}-{symbols[j]}{j}" for i, j in bonds)
+    )
+
+
+def count_bond_changes(
+    reactant_xyz: str | Path,
+    product_xyz: str | Path,
+    *,
+    scale: float = 1.20,
+) -> tuple[int, int]:
+    """Count covalent bonds added and removed between two XYZ structures.
+
+    Returns ``(added, removed)`` from the reactant to the product bond graph.
+    Raises ``ValueError`` when the structures have mismatched atoms.
+    """
+    r_symbols, r_coords = read_xyz_frame(reactant_xyz)
+    p_symbols, p_coords = read_xyz_frame(product_xyz)
+    if r_symbols != p_symbols:
+        raise ValueError(
+            "Reactant and product XYZ files have different atom symbols: "
+            f"{reactant_xyz} vs {product_xyz}"
+        )
+    reactant_bonds = infer_bond_pairs(r_symbols, r_coords, scale=scale)
+    product_bonds = infer_bond_pairs(p_symbols, p_coords, scale=scale)
+    return (
+        len(product_bonds - reactant_bonds),
+        len(reactant_bonds - product_bonds),
+    )
+
+
 def normalize_driving_coord(coord: Sequence[object]) -> DrivingCoord:
     """Normalize ADD/BREAK driving coordinates to a stable 1-based tuple."""
     if len(coord) != 3:

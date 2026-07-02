@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -23,8 +24,13 @@ def _append_local_pygsm_path() -> None:
     if env_path:
         candidates.append(Path(env_path).expanduser())
 
-    # Local development fallback: ../se-gsm/pyGSM next to this workspace.
-    candidates.append(module_path.parents[2] / "se-gsm" / "pyGSM")
+    # Local development fallbacks (only used when pyGSM is not pip-installed and
+    # REACTIP_PYGSM_DIR is unset). The pinned dependency is the snu-lcbc fork
+    # (pyGSM @ git+https://github.com/snu-lcbc/pyGSM.git@reactip-compat); this
+    # matches the local checkout layout used during development.
+    workspace_root = module_path.parents[2]          # .../workdir_reactip
+    candidates.append(workspace_root / "growth_string_method" / "pyGSM")
+    candidates.append(workspace_root / "se-gsm" / "pyGSM")  # legacy layout
 
     for candidate in candidates:
         if candidate.is_dir():
@@ -110,13 +116,36 @@ def read_isomers_file(filepath: str) -> list:
 
 
 def _require_supported_state(charge: int, multiplicity: int, adiabatic_state: int) -> None:
+    """Validate (and permit) the requested electronic state.
+
+    The ReactIP MLIP maps (atomic positions, species) -> energy/forces and has
+    **no spin or charge input channel** (see ``ReactIPLoT.run`` and
+    ``ReactIPCalculator.calculate``, which pass only the ASE ``atoms``). Charge,
+    spin multiplicity and adiabatic-state index are therefore pyGSM *bookkeeping*
+    only: for a given geometry the potential-energy surface is identical for
+    every state.
+
+    Non-default states used to hard-fail. They are now permitted so the
+    singlet-trained model can be *probed* on open-shell systems (e.g. ``RH + 3O2``
+    H-abstraction on the triplet surface), but a warning is emitted: the returned
+    energies/forces are the singlet-trained values regardless of the requested
+    ``(charge, multiplicity, state)``, so any open-shell run is purely
+    extrapolative and the numbers will match the corresponding singlet run.
+    """
+    if not isinstance(multiplicity, int) or multiplicity < 1:
+        raise ValueError(f"multiplicity must be a positive integer, got {multiplicity!r}.")
+    if not isinstance(adiabatic_state, int) or adiabatic_state < 0:
+        raise ValueError(f"adiabatic_state must be a non-negative integer, got {adiabatic_state!r}.")
     requested = (charge, multiplicity, adiabatic_state)
     if requested != DEFAULT_STATE_KEY:
-        raise NotImplementedError(
-            "Unsupported state/model request "
-            f"{requested}. V1 runtime support is restricted to "
-            f"{DEFAULT_STATE_KEY}; the interface is reserved for future "
-            "open-shell and multi-state expansion."
+        warnings.warn(
+            f"Requested electronic state {requested} differs from the trained "
+            f"default {DEFAULT_STATE_KEY}. The ReactIP MLIP has no spin/charge "
+            "input: energy and forces depend on geometry and species only, so the "
+            "PES (barriers, products) is identical for every state. The requested "
+            "state is bookkeeping only; results stay the singlet-trained values "
+            "and are extrapolative for open-shell/charged systems.",
+            stacklevel=2,
         )
 
 
@@ -274,6 +303,35 @@ def _build_optimizer(name: str):
     raise ValueError(f"Unknown optimizer: {name}")
 
 
+def _ase_atoms_to_pygsm_geom(atoms) -> list[list[object]]:
+    return [
+        [symbol, float(x), float(y), float(z)]
+        for symbol, (x, y, z) in zip(atoms.get_chemical_symbols(), atoms.get_positions())
+    ]
+
+
+def _read_xyz_geometries(xyz_file: str | os.PathLike[str]) -> list[list[list[object]]]:
+    """Read simple XYZ or ASE extended XYZ into pyGSM geometry records."""
+    try:
+        return manage_xyz.read_xyzs(str(xyz_file))
+    except Exception as pygsm_exc:
+        try:
+            import ase.io
+
+            frames = ase.io.read(str(xyz_file), index=":")
+        except Exception as ase_exc:
+            raise ValueError(
+                f"Could not read XYZ file {xyz_file!s} with pyGSM or ASE. "
+                f"pyGSM error: {pygsm_exc}; ASE error: {ase_exc}"
+            ) from ase_exc
+
+        if not isinstance(frames, list):
+            frames = [frames]
+        if not frames:
+            raise ValueError(f"XYZ file {xyz_file!s} did not contain any frames")
+        return [_ase_atoms_to_pygsm_geom(atoms) for atoms in frames]
+
+
 def _determine_status(
     *,
     is_converged: bool,
@@ -359,7 +417,51 @@ def _analyze_gsm_result(gsm: SE_GSM) -> dict:
         "score_delta_e": score_delta_e,
         "score_delta_e_source": score_delta_e_source,
         "energies": energies,
+        "ts_imaginary_mode_count": None,
+        "ts_is_first_order_saddle": None,
+        "ts_imaginary_frequencies_cm": None,
+        "ts_lowest_real_frequency_cm": None,
+        "ts_frequency_threshold_cm": None,
+        "ts_verification_error": None,
     }
+
+
+def _verify_ts_or_warning(
+    *,
+    lot,
+    geom,
+    multiplicity: int,
+    adiabatic_state: int,
+    displacement: float,
+) -> dict:
+    """Run the MLIP Hessian / imaginary-frequency check on a TS node geometry.
+
+    Returns a dict of ``ts_*`` fields. Failures are non-fatal: they are reported
+    via ``ts_verification_error`` so the surrounding search keeps running.
+    """
+    from .ts_validation import verify_transition_state
+
+    try:
+        registry = getattr(lot, "calculator_registry", None)
+        if not registry:
+            return {"ts_verification_error": "no calculator available on the level of theory"}
+        calculator = registry.get((getattr(lot, "charge", 0), multiplicity, adiabatic_state))
+        if calculator is None:
+            calculator = next(iter(registry.values()))
+        symbols = manage_xyz.get_atoms(geom)
+        coordinates = manage_xyz.xyz_to_np(geom)
+        analysis = verify_transition_state(
+            calculator, symbols, coordinates, displacement=displacement
+        )
+        payload = analysis.as_dict()
+        payload["ts_verification_error"] = None
+        print(
+            f"  TS verification: {analysis.imaginary_mode_count} imaginary mode(s); "
+            f"first-order saddle={analysis.is_first_order_saddle}"
+        )
+        return payload
+    except Exception as exc:  # noqa: BLE001 — verification must never abort a run
+        return {"ts_verification_error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def run_se_gsm(
@@ -389,6 +491,8 @@ def run_se_gsm(
     max_force: float = 100.0,
     max_abs_energy: float = 10000.0,
     reactant_geom_fixed: bool = False,
+    verify_ts: bool = False,
+    ts_hessian_displacement: float = 0.005,
     ID: int = 0,
 ) -> dict:
     """Run SE-GSM with the ML potential as the single-state backend.
@@ -403,7 +507,7 @@ def run_se_gsm(
     if isinstance(driving_coords, str):
         driving_coords = read_isomers_file(driving_coords)
 
-    geoms = manage_xyz.read_xyzs(xyz_file)
+    geoms = _read_xyz_geometries(xyz_file)
     geom = geoms[0]
 
     if lot is not None and any(
@@ -496,7 +600,18 @@ def run_se_gsm(
         print(f"\n  TS node: {result['ts_node']}")
         print(f"  TS barrier: {result['ts_energy']:.2f} kcal/mol")
         print(f"  Delta E (rxn): {result['delta_e']:.2f} kcal/mol")
-        manage_xyz.write_xyz(f"TSnode_{ID}.xyz", gsm.nodes[result["ts_node"]].geometry)
+        ts_geom = gsm.nodes[result["ts_node"]].geometry
+        manage_xyz.write_xyz(f"TSnode_{ID}.xyz", ts_geom)
+        if verify_ts:
+            result.update(
+                _verify_ts_or_warning(
+                    lot=lot,
+                    geom=ts_geom,
+                    multiplicity=multiplicity,
+                    adiabatic_state=adiabatic_state,
+                    displacement=ts_hessian_displacement,
+                )
+            )
     else:
         print(f"\n  No unique TS was identified. status={result['status']}")
         if result["score_delta_e"] is not None:
@@ -533,12 +648,20 @@ def main():
     parser.add_argument("--xyz", required=True, help="Reactant XYZ file")
     parser.add_argument("--isomers", required=True, help="Driving coordinates (isomers) file")
     parser.add_argument("--device", default="cuda", help="PyTorch device (default: cuda)")
-    parser.add_argument("--charge", type=int, default=0, help="Molecular charge (v1 supports only 0)")
+    parser.add_argument(
+        "--charge",
+        type=int,
+        default=0,
+        help="Molecular charge (bookkeeping only; the MLIP has no charge input)",
+    )
     parser.add_argument(
         "--multiplicity",
         type=int,
         default=1,
-        help="Spin multiplicity (v1 supports only 1)",
+        help=(
+            "Spin multiplicity, e.g. 3 for a triplet O2 system (bookkeeping only; "
+            "the MLIP has no spin input so the PES is identical to the singlet run)"
+        ),
     )
     parser.add_argument(
         "--adiabatic-state",
