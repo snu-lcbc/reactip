@@ -9,16 +9,14 @@ from pathlib import Path
 import numpy as np
 
 
-_COVALENT_RADII = {
-    "H": 0.31,
-    "C": 0.76,
-    "N": 0.71,
-    "O": 0.66,
-    "F": 0.57,
-    "S": 1.05,
-    "Cl": 1.02,
-    "Br": 1.20,
-}
+# Covalent radii and the bond-detection cutoff scale are defined ONCE in
+# reactip.sampling and imported here so the sampler, the trajectory tools and
+# the figures all perceive identical connectivity (see BOND_SCALE).
+from reactip.sampling import (  # noqa: E402
+    BOND_SCALE,
+    COVALENT_RADII as _COVALENT_RADII,
+    DEFAULT_COVALENT_RADIUS as _DEFAULT_RADIUS,
+)
 
 # CPK-style atom colors for the shaded-sphere ball-and-stick renderer.
 _ELEMENT_COLORS = {
@@ -50,7 +48,7 @@ _BOND_REF = {
 
 # Ball-and-stick rendering parameters.
 _DEFAULT_COLOR = "#9a9a9a"
-_DEFAULT_RADIUS = 0.77        # covalent-radius fallback (also used for bond detection)
+# _DEFAULT_RADIUS is imported from reactip.sampling (single source of truth).
 _ATOM_SCALE = 0.45            # sphere radius as a fraction of the covalent radius
 _MULTI_OFFSET = 0.26          # half-separation (A) between parallel double/triple sticks
 _BOND_LW = 2.2                # single-bond stick core width (points); higher orders thinner
@@ -179,8 +177,66 @@ def find_preferred_trajectory_source(run_dir: str | Path, run_id: int) -> Path:
     )
 
 
+def resolve_trajectory_source(
+    run_dir: str | Path,
+    recorded_source: str | Path | None = None,
+    run_id: int = 0,
+) -> Path | None:
+    """Locate a candidate's SE-GSM trajectory XYZ, robust to stale absolute paths.
+
+    A summary's ``trajectory_source`` is an absolute path recorded on the compute
+    node (e.g. ``/…/cscratch/jobs/<uuid>/…/opt_converged_000.xyz``). Once the run
+    tree is copied elsewhere that path no longer resolves, which is why figures
+    (``trajectory.gif``) silently went missing. This resolves the trajectory
+    *locally*, in priority order:
+
+    1. ``recorded_source`` as-is, then by basename in ``run_dir`` and
+       ``run_dir/scratch`` (handles the copied/renamed tree);
+    2. the conventional fully-optimized → grown-string filenames for this
+       ``run_id``, then any run id, in ``run_dir`` and ``scratch``;
+    3. partial ``growth_iters_*.xyz`` snapshots (failed/non-converged runs) —
+       the most-grown string.
+
+    Returns a :class:`pathlib.Path`, or ``None`` when nothing is found. Never
+    raises, so callers can degrade to the static energy-profile fallback.
+    """
+    run_dir = Path(run_dir)
+    search_dirs = [run_dir, run_dir / "scratch"]
+
+    if recorded_source:
+        name = Path(recorded_source).name
+        for candidate in (run_dir / name, run_dir / "scratch" / name, Path(recorded_source)):
+            if candidate.exists():
+                return candidate
+
+    exact = [
+        f"opt_converged_{run_id:03d}.xyz",
+        f"grown_string1_{run_id:03d}.xyz",
+        f"grown_string_{run_id:03d}.xyz",
+    ]
+    globs = ["opt_converged_*.xyz", "grown_string1_*.xyz", "grown_string_*.xyz"]
+    for name in exact:
+        for search_dir in search_dirs:
+            candidate = search_dir / name
+            if candidate.exists():
+                return candidate
+    for pattern in globs:
+        for search_dir in search_dirs:
+            hits = sorted(search_dir.glob(pattern))
+            if hits:
+                return hits[0]
+
+    for search_dir in search_dirs:
+        hits = sorted(search_dir.glob(f"growth_iters_{run_id:03d}_*.xyz")) or sorted(
+            search_dir.glob("growth_iters_*.xyz")
+        )
+        if hits:
+            return hits[-1]
+    return None
+
+
 def bonds_with_order(
-    frame: TrajectoryFrame, scale: float = 1.20
+    frame: TrajectoryFrame, scale: float = BOND_SCALE
 ) -> list[tuple[int, int, int]]:
     """Detected bonds as ``(i, j, order)`` with ``order`` in {1, 2, 3}.
 
@@ -213,7 +269,7 @@ def bonds_with_order(
     return bonds
 
 
-def infer_bonds(frame: TrajectoryFrame, scale: float = 1.20) -> list[tuple[int, int]]:
+def infer_bonds(frame: TrajectoryFrame, scale: float = BOND_SCALE) -> list[tuple[int, int]]:
     """Connectivity only (no bond order); see :func:`bonds_with_order`."""
     return [(i, j) for i, j, _order in bonds_with_order(frame, scale)]
 

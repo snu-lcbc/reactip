@@ -80,11 +80,42 @@ python run_se_gsm.py \
 
 ## How candidates are generated
 
-Candidate generation is implemented in `reactip/sampling.py`.
+Candidate generation is implemented in `reactip/sampling.py`. Two strategies
+are available via `--sample-pool-strategy`:
 
-- Existing bonds are inferred from covalent radii and the current XYZ geometry.
-- Candidate operations are written as pyGSM-style driving coordinates:
-  `ADD i j`, `BREAK i j`, or small coordinate sets containing multiple entries.
+### `rule_based` (default)
+
+Valence-bounded, complexity-bounded, symmetry-reduced generation following the
+ARD-GSM rules of the group's Dandelion prior work
+(`generate_rule_based_pool`). A bond change is proposed only if:
+
+- every atom whose coordination changes stays within its element connection
+  limits (`CONNECTION_LIMITS_CLOSED_SHELL`, taken verbatim from ARD-GSM
+  `limits.py`: H 1–1, C 2–4, N 1–3, O 1–2, F 1–1, S 1–4, Cl 1–1, Br 1–1,
+  Li 0–1 — enforcing the minimum makes these neutral closed-shell bounds); and
+- the step is elementary: at most `--sample-maxbreak` breaks (default 1),
+  `--sample-maxform` forms (default 1), `--sample-maxchange` total changes
+  (default 2).
+
+Topologically equivalent atoms (methyl H's, phenyl ortho carbons) are found by
+Weisfeiler–Lehman graph refinement and collapsed, so symmetry-redundant
+coordinate sets are removed. **Hydrogen is included by default here** — the
+pruned H pool is small and chemically meaningful (H-abstraction, H-shift).
+Across 3–17-heavy-atom reactants this yields 15–118× fewer candidates than the
+exhaustive enumerator with hydrogen (median 63×), while removing hypervalent /
+under-coordinated products the enumerator would generate and waste an SE-GSM
+run discarding.
+
+For radical / combustion chemistry, `--sample-open-shell` switches to a relaxed
+connection-limit table (minima dropped to 0) that admits homolysis and
+O-centred-radical steps. **Note** the shipped MLIP is neutral-singlet only, so
+radical energetics from it are extrapolative.
+
+### `exhaustive`
+
+The legacy geometric enumerator (`generate_driving_coordinate_pool`), kept for
+benchmark reproducibility.
+
 - Available sample modes are `add`, `break`, `exchange`, and `two_add`.
 - Hydrogen atoms are excluded by default; use `--sample-include-hydrogen` to
   include them.
@@ -166,11 +197,24 @@ for the in-domain small molecules while still catching extrapolation failures.
 ### Product de-duplication
 
 Different driving coordinates frequently converge to the **same** product. By
-default such candidates are merged by product bond graph before the Boltzmann
-normalization (the best-scoring representative is kept; the rest are recorded
-with reason `duplicate product of <id>`). This prevents a degenerate product
-from being counted several times and inflating its apparent population. Disable
-with `--sample-no-dedupe-products`.
+default such candidates are merged before the Boltzmann normalization (the
+best-scoring representative is kept; the rest are recorded with reason
+`duplicate product of <id>`). Merging uses a **symmetry-invariant canonical
+bond signature** (`canonical_bond_signature` in `reactip/sampling.py`): each
+product bond is keyed on the Weisfeiler–Lehman symmetry classes of its
+endpoints, so two products that are the same species up to atom relabeling
+(mirror images) are correctly recognized as identical — an index-based
+signature misses these and double-counts them. This prevents a degenerate
+product from inflating its apparent population. Disable with
+`--sample-no-dedupe-products`.
+
+Each ranked product also carries honest ranking-semantics fields:
+`relative_stability_score` (the Boltzmann weight, named to signal it is not an
+equilibrium concentration), `kinetics_status`
+(`ts_verified` / `ts_geometric` / `no_ts_thermodynamic_only`), and
+`is_fragmentation`. The run summary's `ranking_semantics` block documents what
+the score omits (ZPE, thermal ΔG/entropy, fragmentation entropy, solvation),
+the effective sampling temperature, and the subset normalization.
 
 ### Transition-state verification
 

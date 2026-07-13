@@ -24,6 +24,7 @@ import inspect
 import json
 import math
 import os
+import random
 import shutil
 import sys
 import traceback
@@ -41,11 +42,14 @@ from reactip.utils import (
 )
 from reactip.sampling import (
     DEFAULT_SAMPLE_MODES,
+    POOL_STRATEGIES,
     bond_signature,
+    canonical_bond_signature,
     compute_boltzmann_populations,
     count_bond_changes,
     driving_coords_to_lines,
     generate_driving_coordinate_pool,
+    generate_rule_based_pool,
     normalize_driving_coord_set,
     parse_sample_modes,
     sample_driving_coordinate_sets,
@@ -419,6 +423,23 @@ def run_with_reporting(
         }
 
         summary_path = write_summary_json(summary, run_dir / "summary.json")
+
+        # Single-run mode gets the same default artifacts as a sampled candidate:
+        # export_trajectory_artifacts already wrote trajectory.gif + .sdf above;
+        # add the static reactant -> product reaction.png here so a one-off run
+        # produces both figures by default.
+        if export_artifacts:
+            try:
+                from reactip.run_figures import render_run_reaction_png
+
+                render_run_reaction_png(
+                    run_dir, summary=summary, run_id=run_id, overwrite=True
+                )
+            except Exception as exc:
+                print(
+                    f"[warn] reaction.png render failed "
+                    f"({exc.__class__.__name__}: {exc}); trajectory.gif/.sdf are intact"
+                )
     finally:
         os.chdir(previous_cwd)
 
@@ -629,15 +650,23 @@ def _dedupe_eligible_by_product(
     (lowest ranking score, preferring verified/peaked TS), marking the rest
     excluded so they still appear in the JSON with a reason.
     """
-    groups: dict[tuple[str, ...], list[tuple[dict, float]]] = {}
+    groups: dict[tuple, list[tuple[dict, float]]] = {}
     survivors: list[tuple[dict, float]] = []
     for candidate, score in eligible:
-        signature = candidate.get("product_bond_signature")
-        if not signature:
-            # No structural signature available; never merge these.
-            survivors.append((candidate, score))
-            continue
-        groups.setdefault(tuple(signature), []).append((candidate, score))
+        # Prefer the symmetry-invariant canonical signature (merges mirror-image
+        # relabelings of the same product); fall back to the index-aware bond
+        # signature for candidates produced before it was recorded.
+        canonical = candidate.get("product_canonical_signature")
+        if canonical:
+            key: tuple = ("canon", canonical)
+        else:
+            signature = candidate.get("product_bond_signature")
+            if not signature:
+                # No structural signature available; never merge these.
+                survivors.append((candidate, score))
+                continue
+            key = ("index", tuple(signature))
+        groups.setdefault(key, []).append((candidate, score))
 
     for members in groups.values():
         members.sort(
@@ -656,6 +685,26 @@ def _dedupe_eligible_by_product(
             )
             candidate["duplicate_of"] = representative.get("candidate_id")
     return survivors
+
+
+def _kinetics_status(candidate: dict) -> str:
+    """Classify how much kinetic evidence backs a ranked product.
+
+    - ``ts_verified``: a first-order saddle (exactly one imaginary mode) links
+      reactant and product along the whole path.
+    - ``ts_geometric``: SE-GSM reports a single energy peak (has_ts) but the
+      saddle was not frequency-verified.
+    - ``no_ts_thermodynamic_only``: no barrier was located; the product is
+      ranked on its relative electronic energy alone and the ranking says
+      nothing about whether it is kinetically accessible.
+    """
+    if candidate.get("ts_is_first_order_saddle") is True and candidate.get(
+        "path_all_steps_have_ts"
+    ):
+        return "ts_verified"
+    if candidate.get("has_ts") or candidate.get("path_all_steps_have_ts"):
+        return "ts_geometric"
+    return "no_ts_thermodynamic_only"
 
 
 def _ranked_population_view(
@@ -703,6 +752,19 @@ def _ranked_population_view(
             "ranking_score_delta_e": score,
             "boltzmann_log_factor": population["boltzmann_log_factor"],
             "relative_population": relative_population,
+            # Honest naming: this is a RELATIVE-STABILITY weight from a
+            # max-shifted Boltzmann factor over the (electronic) ranking energy,
+            # NOT an equilibrium concentration. It ignores entropy/ZPE and is
+            # normalized only over the sampled, ranked subset.
+            "relative_stability_score": relative_population,
+            "kinetics_status": _kinetics_status(candidate),
+            # A change in the number of disconnected fragments makes the
+            # electronic-energy ranking least reliable (translational/rotational
+            # entropy, ~10 kcal/mol at 298 K, is omitted); flag it for the report.
+            "is_fragmentation": (
+                (candidate.get("product_bond_removed") or 0)
+                > (candidate.get("product_bond_added") or 0)
+            ),
         }
         rows.append(row)
 
@@ -818,12 +880,17 @@ def run_sampled_product_search(
     sample_score_mode: str = "thermodynamic",
     sample_min_quality: str = "converged",
     sample_seed: int | None = 0,
+    sample_pool_strategy: str = "rule_based",
     sample_modes: str | tuple[str, ...] = DEFAULT_SAMPLE_MODES,
     sample_include_hydrogen: bool = False,
     sample_add_max_distance: float = 5.0,
     sample_bond_scale: float = 1.20,
     sample_allow_shared_add_atoms: bool = False,
-    sample_export_artifacts: bool = False,
+    sample_open_shell: bool = False,
+    sample_maxbreak: int = 1,
+    sample_maxform: int = 1,
+    sample_maxchange: int = 2,
+    sample_export_artifacts: bool = True,
     sample_reuse_calculator: bool = True,
     sample_require_bond_change: bool = True,
     sample_max_abs_delta_e: float | None = DEFAULT_MAX_ABS_DELTA_E,
@@ -851,6 +918,10 @@ def run_sampled_product_search(
         raise ValueError(
             "sample_min_quality must be one of: "
             + ", ".join(SAMPLE_MIN_QUALITY_LEVELS)
+        )
+    if sample_pool_strategy not in POOL_STRATEGIES:
+        raise ValueError(
+            "sample_pool_strategy must be one of: " + ", ".join(POOL_STRATEGIES)
         )
 
     parsed_sample_modes = parse_sample_modes(sample_modes)
@@ -960,6 +1031,11 @@ def run_sampled_product_search(
         "sample_score_mode": sample_score_mode,
         "sample_min_quality": sample_min_quality,
         "sample_seed": sample_seed,
+        "sample_pool_strategy": sample_pool_strategy,
+        "sample_open_shell": sample_open_shell,
+        "sample_maxbreak": sample_maxbreak,
+        "sample_maxform": sample_maxform,
+        "sample_maxchange": sample_maxchange,
         "sample_modes": list(parsed_sample_modes),
         "sample_include_hydrogen": sample_include_hydrogen,
         "sample_add_max_distance": sample_add_max_distance,
@@ -973,6 +1049,45 @@ def run_sampled_product_search(
         "reuse_shared_calculator": sample_reuse_calculator and shared_calculator is not None,
         "root_abs_energy_ev": root_abs_energy_ev,
         "shared_calculator_error": shared_calculator_error,
+    }
+
+    # Explicit statement of what the ranking score means and what it omits, so
+    # the summary is self-documenting and the numbers cannot be over-interpreted
+    # as equilibrium concentrations. Consumed by reporting.py.
+    ranking_semantics_payload = {
+        "score_name": "relative_stability_score",
+        "definition": (
+            "max-shifted Boltzmann weight exp(-dE/RT) over the electronic "
+            "ranking energy dE of each de-duplicated product, normalized over "
+            "the ranked subset"
+        ),
+        "energy_basis": "electronic_potential_energy",
+        "effective_sampling_temperature_K": temperature,
+        "omits": [
+            "vibrational_zero_point_energy",
+            "thermal_enthalpy_and_entropy (no rigid-rotor/harmonic dG)",
+            "translational_rotational_entropy_for_fragmentations (~10 kcal/mol at 298 K)",
+            "solvation",
+        ],
+        "normalization": "sampled_ranked_subset_only_not_full_reaction_space",
+        "kinetics": (
+            "populations do not encode kinetic accessibility; see per-product "
+            "kinetics_status (ts_verified / ts_geometric / no_ts_thermodynamic_only)"
+        ),
+        "spin_charge_state": {
+            "charge": charge,
+            "multiplicity": multiplicity,
+            "note": (
+                "MLIP energy function is neutral-singlet only; open-shell or "
+                "charged products are extrapolative"
+            ),
+        },
+        "dedupe": (
+            "symmetry-invariant canonical bond signature (Weisfeiler-Lehman "
+            "classes); mirror-image relabelings of one product are merged"
+            if sample_dedupe_products
+            else "disabled"
+        ),
     }
 
     def _write_partial_search_summary() -> None:
@@ -990,6 +1105,7 @@ def run_sampled_product_search(
             "initial_xyz_file": str(initial_xyz_path),
             "run_directory": str(run_dir),
             "search_parameters": search_parameters_payload,
+            "ranking_semantics": ranking_semantics_payload,
             "iterations": iteration_reports,
             "iterations_requested": sample_iterations,
             "iterations_completed": iterations_completed,
@@ -1015,13 +1131,6 @@ def run_sampled_product_search(
             if sample_seed is not None:
                 seed = int(sample_seed) + iteration * 100000 + parent_index * 1000
 
-            pool_kwargs = dict(
-                include_hydrogen=sample_include_hydrogen,
-                max_add_distance=sample_add_max_distance,
-                bond_scale=sample_bond_scale,
-                modes=parsed_sample_modes,
-                allow_shared_add_atoms=sample_allow_shared_add_atoms,
-            )
             use_curated = (
                 curated_root_pool is not None
                 and iteration == 1
@@ -1030,28 +1139,62 @@ def run_sampled_product_search(
             exhaustive_now = sample_all or (
                 sample_all_first_iteration and iteration == 1
             )
+
+            def _build_full_pool():
+                """Build the driving-coordinate pool for this parent per strategy.
+
+                Deferred so the curated-override branch never pays the
+                enumeration cost it exists to avoid.
+                """
+                if sample_pool_strategy == "rule_based":
+                    # Valence + bounded-complexity + symmetry pruned (ARD-GSM
+                    # rules). Hydrogen is included by default: the pruned H pool
+                    # is small and chemically meaningful.
+                    return generate_rule_based_pool(
+                        parent_xyz,
+                        include_hydrogen=sample_include_hydrogen,
+                        bond_scale=sample_bond_scale,
+                        maxbreak=sample_maxbreak,
+                        maxform=sample_maxform,
+                        maxchange=sample_maxchange,
+                        open_shell=sample_open_shell,
+                    ), "rule-based"
+                # Legacy geometric enumeration, kept for benchmark reproducibility.
+                return generate_driving_coordinate_pool(
+                    parent_xyz,
+                    include_hydrogen=sample_include_hydrogen,
+                    max_add_distance=sample_add_max_distance,
+                    bond_scale=sample_bond_scale,
+                    modes=parsed_sample_modes,
+                    allow_shared_add_atoms=sample_allow_shared_add_atoms,
+                ), "enumerated"
+
             if use_curated:
-                # Curated combustion pool for the root reactant.
+                # Curated combustion pool for the root reactant: use it directly
+                # and skip pool generation entirely (the whole point of curation).
                 sampled_sets = curated_root_pool
                 print(
                     f"  Parent {parent_id}: using {len(sampled_sets)} CURATED "
                     f"driving-coordinate set(s) from {sample_pool_file}"
                 )
             elif exhaustive_now:
-                # Exhaustive: run every enumerated driving-coordinate set (the
-                # full graph-enumeration pool), as in the RPS/Halo8 papers.
-                sampled_sets = generate_driving_coordinate_pool(parent_xyz, **pool_kwargs)
+                # Run every set in the pool (no random sub-sampling).
+                full_pool, pool_desc = _build_full_pool()
+                sampled_sets = full_pool
                 print(
-                    f"  Parent {parent_id}: enumerated ALL {len(sampled_sets)} "
-                    f"driving-coordinate set(s) from {parent_xyz}"
+                    f"  Parent {parent_id}: running ALL {len(sampled_sets)} "
+                    f"{pool_desc} driving-coordinate set(s) from {parent_xyz}"
                 )
             else:
-                sampled_sets = sample_driving_coordinate_sets(
-                    parent_xyz, sample_count=sample_count, random_seed=seed, **pool_kwargs
-                )
+                # Randomly sample sample_count sets from the full pool.
+                full_pool, pool_desc = _build_full_pool()
+                rng = random.Random(seed)
+                shuffled = list(full_pool)
+                rng.shuffle(shuffled)
+                sampled_sets = shuffled[:sample_count]
                 print(
-                    f"  Parent {parent_id}: sampled {len(sampled_sets)} of the "
-                    f"enumerated pool from {parent_xyz}"
+                    f"  Parent {parent_id}: sampled {len(sampled_sets)} of "
+                    f"{len(full_pool)} {pool_desc} set(s) from {parent_xyz}"
                 )
 
             for sample_index, driving_coords in enumerate(sampled_sets, start=1):
@@ -1157,6 +1300,7 @@ def run_sampled_product_search(
                 product_bond_added = None
                 product_bond_removed = None
                 product_bond_signature = None
+                product_canonical_signature = None
                 product_abs_energy_ev = None
                 if product_xyz is not None:
                     try:
@@ -1165,8 +1309,15 @@ def run_sampled_product_search(
                             product_xyz,
                             scale=sample_bond_scale,
                         )
+                        # Index-aware signature (kept for audit/back-compat) plus a
+                        # symmetry-invariant canonical signature used for ranking
+                        # de-duplication so mirror-image relabelings of the same
+                        # product are merged rather than double-counted.
                         product_bond_signature = list(
                             bond_signature(product_xyz, scale=sample_bond_scale)
+                        )
+                        product_canonical_signature = repr(
+                            canonical_bond_signature(product_xyz, scale=sample_bond_scale)
                         )
                     except Exception as exc:
                         warnings.append(f"Bond-change check failed: {exc}")
@@ -1201,6 +1352,7 @@ def run_sampled_product_search(
                     "product_bond_added": product_bond_added,
                     "product_bond_removed": product_bond_removed,
                     "product_bond_signature": product_bond_signature,
+                    "product_canonical_signature": product_canonical_signature,
                     "product_abs_energy_ev": product_abs_energy_ev,
                     "ts_imaginary_mode_count": summary.get("ts_imaginary_mode_count"),
                     "ts_is_first_order_saddle": summary.get("ts_is_first_order_saddle"),
@@ -1302,6 +1454,7 @@ def run_sampled_product_search(
         "initial_xyz_file": str(initial_xyz_path),
         "run_directory": str(run_dir),
         "search_parameters": search_parameters_payload,
+        "ranking_semantics": ranking_semantics_payload,
         "iterations": iteration_reports,
         "iterations_requested": sample_iterations,
         "iterations_completed": iterations_completed,
@@ -1463,6 +1616,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-products",
         action="store_true",
         help="Sample candidate driving-coordinate sets and rank products instead of running one --isomers file.",
+    )
+    sampling.add_argument(
+        "--sample-pool-strategy",
+        choices=POOL_STRATEGIES,
+        default="rule_based",
+        help=(
+            "How the driving-coordinate pool is built. 'rule_based' (default): "
+            "valence-bounded + symmetry-reduced ARD-GSM rules (small, chemically "
+            "meaningful, includes hydrogen). 'exhaustive': legacy geometric "
+            "enumeration (add/break/exchange/two_add), kept for benchmark "
+            "reproducibility; O(N^4) and must exclude hydrogen to stay tractable."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-open-shell",
+        action="store_true",
+        help=(
+            "rule_based only: use the relaxed radical connection limits so bond "
+            "homolysis and O-centred radical steps are permitted (combustion / "
+            "autoxidation). NOTE the shipped MLIP is neutral-singlet only, so "
+            "radical energetics are extrapolative."
+        ),
+    )
+    sampling.add_argument(
+        "--sample-maxbreak", type=int, default=1,
+        help="rule_based only: max bonds broken per elementary step (default 1).",
+    )
+    sampling.add_argument(
+        "--sample-maxform", type=int, default=1,
+        help="rule_based only: max bonds formed per elementary step (default 1).",
+    )
+    sampling.add_argument(
+        "--sample-maxchange", type=int, default=2,
+        help="rule_based only: max total connection changes per step (default 2).",
     )
     sampling.add_argument(
         "--sample-count",
@@ -1647,8 +1834,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sampling.add_argument(
         "--sample-export-artifacts",
-        action="store_true",
-        help="Export SDF/GIF artifacts for every sampled candidate.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export SDF/GIF artifacts for every sampled candidate "
+        "(default: enabled; use --no-sample-export-artifacts to skip).",
     )
     sampling.add_argument(
         "--sample-reload-model-each-candidate",
@@ -1699,6 +1888,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  XYZ        : {Path(args.xyz).resolve()}")
     if args.sample_products:
         print("  Isomers    : sampled")
+        print(f"  Pool       : {args.sample_pool_strategy}"
+              + (" (open-shell)" if args.sample_open_shell else ""))
         print(f"  Samples    : {args.sample_count} per reactant")
         print(f"  Iterations : {args.sample_iterations}")
         print(f"  Resample   : top {args.resample_top_k}")
@@ -1746,6 +1937,11 @@ def main(argv: list[str] | None = None) -> None:
             sample_score_mode=args.sample_score_mode,
             sample_min_quality=args.sample_min_quality,
             sample_seed=args.sample_seed,
+            sample_pool_strategy=args.sample_pool_strategy,
+            sample_open_shell=args.sample_open_shell,
+            sample_maxbreak=args.sample_maxbreak,
+            sample_maxform=args.sample_maxform,
+            sample_maxchange=args.sample_maxchange,
             sample_modes=args.sample_modes,
             sample_include_hydrogen=args.sample_include_hydrogen,
             sample_add_max_distance=args.sample_add_max_distance,
